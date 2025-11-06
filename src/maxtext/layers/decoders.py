@@ -20,6 +20,11 @@ import functools
 from typing import Any
 import warnings
 
+import jax
+import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
+from jax.sharding import Mesh, NamedSharding
+
 from flax import linen as nn
 from flax import nnx
 from flax.linen.partitioning import ScanIn
