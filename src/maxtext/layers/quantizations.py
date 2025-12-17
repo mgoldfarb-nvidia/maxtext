@@ -855,7 +855,7 @@ class TransformerEngineQuantization(Quantization):
         "te_fp8_currentscaling": recipe.Float8CurrentScaling,
         "te_mxfp8": recipe.MXFP8BlockScaling,
         "te_nvfp4": recipe.NVFP4BlockScaling,  # pytype: disable=module-attr
-        "te_nvfp4_no_rht": functools.partial(recipe.NVFP4BlockScaling, disable_rht=True),  # pytype: disable=module-attr
+        # "te_nvfp4": functools.partial(recipe.NVFP4BlockScaling, disable_rht=True),  # pytype: disable=module-attr
     }
     if recipe_name not in RECIPES:
       raise ValueError(f"Invalid TransformerEngine recipe: {recipe_name}")
@@ -943,7 +943,38 @@ class TransformerEngineQuantization(Quantization):
 
     return self._wrap(te_dot_general, "dot_general")
 
-  def einsum(self, dtype: DType = jnp.float32):
+  def einsum(self, *args, **kwargs):
     """Placeholder for einsum implementation in subclasses."""
-    # quant.einsum is only required for MoE or for inference with KVCache.
-    raise ValueError("Einsum is not yet supported for TransformerEngine quantization.")
+    import transformer_engine.jax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+    def te_einsum(generate_quantizer_set, s, x, kernel, **kwargs):
+      quantizer_set = generate_quantizer_set()
+      def dot_general(x, kernel, dims, *args, **kwargs):
+        print(f"TE dot_general called with dims: {dims}, args: {args}, kwargs: {kwargs}")
+        contracting_dims, batch_dims = dims
+        ((x_bdim,), (k_bdim,)) = batch_dims
+        batch_dims = (x_bdim, k_bdim)
+
+        if x.dtype not in [jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64]:
+          # HACK: because x input is bool for some reason
+          x = x.astype(kernel.dtype)
+
+        # Adjust for unbatched
+        contracting_dims = tuple(
+          tuple(dim - (1 if dim > bdim else 0) for dim in cdims) 
+          for bdim, cdims in zip(batch_dims, contracting_dims))
+        
+        f = functools.partial(
+          transformer_engine.jax.dense.dense,
+          contracting_dims=contracting_dims,
+          quantizer_set=quantizer_set)
+        return jax.vmap(f, in_axes=(x_bdim, k_bdim))(
+          x,
+          kernel,
+        )
+      return jnp.einsum(s, x, kernel, _dot_general=dot_general, **kwargs)
+  
+    return functools.partial(te_einsum, lambda s="": transformer_engine.jax.quantize.noop_quantizer_set)
+    # def f(*args, **kwargs):
+    #   print(f"TE einsum called with args: {args}, kwargs: {kwargs}")
+    #   self._wrap(te_einsum, "einsum")()(*args, **kwargs)
+    # return f
