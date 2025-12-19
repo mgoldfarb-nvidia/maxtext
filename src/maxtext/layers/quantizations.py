@@ -949,7 +949,7 @@ class TransformerEngineQuantization(Quantization):
     def te_einsum(generate_quantizer_set, s, x, kernel, **kwargs):
       quantizer_set = generate_quantizer_set()
       def dot_general(x, kernel, dims, *args, **kwargs):
-        print(f"TE dot_general called with dims: {dims}, args: {args}, kwargs: {kwargs}")
+        # print(f"TE dot_general called with dims: {dims}, args: {args}, kwargs: {kwargs}")
         contracting_dims, batch_dims = dims
         ((x_bdim,), (k_bdim,)) = batch_dims
         batch_dims = (x_bdim, k_bdim)
@@ -962,7 +962,7 @@ class TransformerEngineQuantization(Quantization):
         contracting_dims = tuple(
           tuple(dim - (1 if dim > bdim else 0) for dim in cdims) 
           for bdim, cdims in zip(batch_dims, contracting_dims))
-        
+
         f = functools.partial(
           transformer_engine.jax.dense.dense,
           contracting_dims=contracting_dims,
@@ -973,7 +973,8 @@ class TransformerEngineQuantization(Quantization):
         )
       return jnp.einsum(s, x, kernel, _dot_general=dot_general, **kwargs)
   
-    return functools.partial(te_einsum, lambda s="": transformer_engine.jax.quantize.noop_quantizer_set)
+    return self._wrap(te_einsum, "einsum")()
+    # return functools.partial(te_einsum, lambda s="": transformer_engine.jax.quantize.noop_quantizer_set)
     # def f(*args, **kwargs):
     #   print(f"TE einsum called with args: {args}, kwargs: {kwargs}")
     #   self._wrap(te_einsum, "einsum")()(*args, **kwargs)
