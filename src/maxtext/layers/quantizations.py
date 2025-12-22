@@ -856,6 +856,7 @@ class TransformerEngineQuantization(Quantization):
         "te_mxfp8": recipe.MXFP8BlockScaling,
         "te_nvfp4": recipe.NVFP4BlockScaling,  # pytype: disable=module-attr
         # "te_nvfp4": functools.partial(recipe.NVFP4BlockScaling, disable_rht=True),  # pytype: disable=module-attr
+        "te_bf16": lambda: None,
     }
     if recipe_name not in RECIPES:
       raise ValueError(f"Invalid TransformerEngine recipe: {recipe_name}")
@@ -954,8 +955,12 @@ class TransformerEngineQuantization(Quantization):
         ((x_bdim,), (k_bdim,)) = batch_dims
         batch_dims = (x_bdim, k_bdim)
 
+        if x_bdim != 0 or k_bdim != 0:
+          print(f"{x_bdim=}, {k_bdim=}")
+          return jax.lax.dot_general(x, kernel, dims, *args, **kwargs)
+
         if x.dtype not in [jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64]:
-          # HACK: because x input is bool for some reason
+          # HACK: because x input is bool for dispatch mask
           x = x.astype(kernel.dtype)
 
         # Adjust for unbatched
