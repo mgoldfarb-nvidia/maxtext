@@ -946,41 +946,5 @@ class TransformerEngineQuantization(Quantization):
 
   def einsum(self, *args, **kwargs):
     """Placeholder for einsum implementation in subclasses."""
-    import transformer_engine.jax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
-    def te_einsum(generate_quantizer_set, s, x, kernel, **kwargs):
-      quantizer_set = generate_quantizer_set()
-      def dot_general(x, kernel, dims, *args, **kwargs):
-        # print(f"TE dot_general called with dims: {dims}, args: {args}, kwargs: {kwargs}")
-        contracting_dims, batch_dims = dims
-        ((x_bdim,), (k_bdim,)) = batch_dims
-        batch_dims = (x_bdim, k_bdim)
-
-        if x_bdim != 0 or k_bdim != 0:
-          print(f"{x_bdim=}, {k_bdim=}")
-          return jax.lax.dot_general(x, kernel, dims, *args, **kwargs)
-
-        if x.dtype not in [jnp.float16, jnp.bfloat16, jnp.float32, jnp.float64]:
-          # HACK: because x input is bool for dispatch mask
-          x = x.astype(kernel.dtype)
-
-        # Adjust for unbatched
-        contracting_dims = tuple(
-          tuple(dim - (1 if dim > bdim else 0) for dim in cdims) 
-          for bdim, cdims in zip(batch_dims, contracting_dims))
-
-        f = functools.partial(
-          transformer_engine.jax.dense.dense,
-          contracting_dims=contracting_dims,
-          quantizer_set=quantizer_set)
-        return jax.vmap(f, in_axes=(x_bdim, k_bdim))(
-          x,
-          kernel,
-        )
-      return jnp.einsum(s, x, kernel, _dot_general=dot_general, **kwargs)
-  
-    return self._wrap(te_einsum, "einsum")()
-    # return functools.partial(te_einsum, lambda s="": transformer_engine.jax.quantize.noop_quantizer_set)
-    # def f(*args, **kwargs):
-    #   print(f"TE einsum called with args: {args}, kwargs: {kwargs}")
-    #   self._wrap(te_einsum, "einsum")()(*args, **kwargs)
-    # return f
+    import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+    return te_flax.make_einsum_cls(quantization_recipe=self._recipe)
