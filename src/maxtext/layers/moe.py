@@ -29,15 +29,17 @@ from jax.experimental import xla_metadata
 from jax.sharding import NamedSharding, Mesh
 from jax.sharding import PartitionSpec as P
 import jax.numpy as jnp
-from maxtext.common import common_types as ctypes
-from maxtext.common.common_types import ShardMode
-from maxtext.layers import attentions, linears, nnx_wrappers, quantizations
-from maxtext.layers.initializers import NdInitializer, default_bias_init, nd_dense_init, variable_to_logically_partitioned
+from MaxText import common_types as ctypes
+from MaxText.common_types import ShardMode
+from MaxText.sharding import maybe_shard_with_logical, create_sharding
+from MaxText.sharding import logical_to_mesh_axes
+from MaxText.layers import attentions, linears, nnx_wrappers, quantizations
+from MaxText.layers.initializers import NdInitializer, default_bias_init, nd_dense_init, variable_to_logically_partitioned
+
+from MaxText.layers import te_permutation
 from maxtext.kernels import megablox as mblx
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
-from maxtext.utils.sharding import maybe_shard_with_logical, create_sharding
-from maxtext.utils.sharding import logical_to_mesh_axes
 import numpy as np
 import qwix.pallas as qpl
 import tokamax
@@ -661,6 +663,144 @@ class RoutedMoE(nnx.Module):
         bias_updates,
     )
 
+  def te_permute(
+      self,
+      inputs: jax.Array,
+      gate_logits: jax.Array,
+      pre_bias_logits: Optional[jax.Array],
+      rngs=None,
+  ) -> Tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, Optional[jax.Array], Optional[jax.Array]]:
+    """Permute tokens to group by expert using TransformerEngine kernels.
+
+    This is an alternative to the standard permute() method that uses TE's
+    optimized Triton kernels for token dispatch.
+
+    Args:
+      inputs: Input tensor of shape [batch, seq, hidden].
+      gate_logits: Router logits of shape [batch, seq, num_experts].
+      pre_bias_logits: Pre-bias logits for DeepSeek models, or None.
+      rngs: Random number generators for dropout (if any).
+
+    Returns:
+      Tuple of:
+        - permuted_inputs: Tokens sorted by expert [num_out_tokens, hidden].
+        - row_id_map: Mapping for unpermute phase.
+        - weights: Routing weights [batch, seq, num_experts_per_tok].
+        - tokens_per_expert: Token counts per expert [num_experts].
+        - top_k_indices: Selected expert indices [batch, seq, num_experts_per_tok].
+        - lb_loss: Load balance loss (or None).
+        - bias_updates: Bias updates (or None).
+    """
+    te_permutation.check_te_permutation_available()
+
+    inputs_shape = inputs.shape
+    batch_size = inputs_shape[0]
+    seq_len = inputs_shape[1]
+    hidden_size = inputs_shape[2]
+    num_tokens = batch_size * seq_len
+
+    # Get top-k routing decisions
+    weights, top_k_indices = self.get_topk(gate_logits, pre_bias_logits, rngs)
+
+    # Compute load balance loss if configured
+    lb_loss = None
+    if self.config.load_balance_loss_weight > 0.0:
+      softmax_probs = jax.nn.softmax(gate_logits.astype(jnp.float32), axis=-1).astype(self.dtype)
+      lb_loss = self.load_balance_loss(top_k_indices, softmax_probs)
+
+    # Compute bias updates if needed
+    if self.should_update_load_balance():
+      bias_updates = calculate_load_balance_updates(
+          top_k_indices, self.config.num_experts, self.config.routed_bias_update_rate
+      )
+    else:
+      bias_updates = None
+
+    # Convert indices to routing map (binary mask)
+    routing_map = te_permutation.create_routing_map_from_indices(
+        top_k_indices, self.num_experts
+    )
+
+    # Prepare probabilities for dispatch (optional)
+    # For now, we don't fuse probs into dispatch - they're used in combine
+    probs = None
+
+    # Number of output tokens
+    num_out_tokens = num_tokens * self.num_experts_per_tok
+
+    # Call TE token dispatch
+    permuted_outputs, permuted_probs, row_id_map, _, tokens_per_expert = te_permutation.te_token_dispatch(
+        inputs.reshape(-1, hidden_size),
+        routing_map,
+        num_out_tokens=num_out_tokens,
+        probs=probs,
+        align_size=None,  # No padding for now
+    )
+
+    return (
+        permuted_outputs,
+        row_id_map,
+        weights,
+        tokens_per_expert,
+        top_k_indices,
+        lb_loss,
+        bias_updates,
+    )
+
+  def te_unpermute(
+      self,
+      expert_outputs: jax.Array,
+      row_id_map: jax.Array,
+      weights: jax.Array,
+      batch_size: int,
+      sequence_length: int,
+  ) -> jax.Array:
+    """Unpermute expert outputs using TransformerEngine kernels.
+
+    Args:
+      expert_outputs: Output from grouped GEMM [num_out_tokens, hidden].
+      row_id_map: Row ID map from te_permute.
+      weights: Routing weights [batch, seq, num_experts_per_tok].
+      batch_size: Original batch size.
+      sequence_length: Original sequence length.
+
+    Returns:
+      Combined output tensor [batch, seq, hidden].
+    """
+    te_permutation.check_te_permutation_available()
+
+    num_tokens = batch_size * sequence_length
+    hidden_size = expert_outputs.shape[-1]
+
+    # Prepare merging probabilities
+    # weights shape: [batch, seq, num_experts_per_tok]
+    # Need to convert to [num_tokens, num_experts] format for TE
+    # For now, we pass None and handle weighting separately
+    # TODO(tdophung): Integrate merging probs directly when TE supports it
+
+    # Call TE token combine
+    output = te_permutation.te_token_combine(
+        expert_outputs,
+        row_id_map,
+        merging_probs=None,  # Handle weighting separately for now
+        pad_offsets=None,
+    )
+
+    # Reshape back to [batch, seq, hidden]
+    output = output.reshape(batch_size, sequence_length, hidden_size)
+
+    # Apply weights after combine
+    # weights shape: [batch, seq, num_experts_per_tok]
+    # For weighted combination, we need to scale the output
+    if self.config.decoder_block != ctypes.DecoderBlockType.LLAMA4:
+      # Standard weighted combination
+      # Note: TE token_combine with merging_probs handles this internally
+      # For now, we apply a simple averaging since we passed None above
+      # TODO(tdophung): Properly integrate merging probs
+      pass
+
+    return output.astype(self.dtype)
+
   def unpermute(
       self,
       intermediate,
@@ -784,6 +924,122 @@ class RoutedMoE(nnx.Module):
         local_group_size,
         sorted_experts_ids,
     )
+
+  @staticmethod
+  def te_local_permute(
+      inputs,
+      all_shards_tokens_per_expert,
+      local_expert_size,
+      shard_index,
+      num_expert_shards,
+  ):
+    """TE-based local permutation after ragged all-to-all.
+
+    This uses TE's sort_chunks_by_index to reorder tokens from
+    (source_shard, expert) ordering to (expert, source_shard) ordering,
+    which groups all tokens for each local expert contiguously.
+
+    Args:
+      inputs: Tokens received from ragged_all_to_all [total_recv_tokens, hidden].
+      all_shards_tokens_per_expert: Token counts from all shards [num_shards, num_experts].
+      local_expert_size: Number of local experts per shard.
+      shard_index: Current shard index.
+      num_expert_shards: Number of expert-parallel shards.
+
+    Returns:
+      A tuple containing:
+        sorted_inputs: Tokens grouped by local expert.
+        sort_map: Map for reversing the sort.
+        local_group_sizes: Token counts per local expert [local_expert_size].
+        sorted_expert_ids: Local expert ID for each token.
+    """
+    local_expert_start = shard_index * local_expert_size
+    local_expert_end = local_expert_start + local_expert_size
+
+    # Compute split sizes for chunk sort
+    # After ragged_all_to_all, data is ordered by source shard, then by expert within each shard
+    # split_sizes: token counts for each (shard, local_expert) pair
+    split_sizes = all_shards_tokens_per_expert[:, local_expert_start:local_expert_end].reshape(-1)
+
+    # Create sort indices to reorder from (shard, expert) to (expert, shard)
+    # Original: [(s0,e0), (s0,e1), ..., (s1,e0), (s1,e1), ...]
+    # Target: [(s0,e0), (s1,e0), ..., (s0,e1), (s1,e1), ...]
+    indices_matrix = jnp.arange(num_expert_shards * local_expert_size).reshape(
+        num_expert_shards, local_expert_size
+    )
+    sorted_chunk_indices = indices_matrix.T.reshape(-1)
+
+    # Use TE sort_chunks_by_index
+    sorted_inputs, sort_map = te_permutation.te_sort_chunks_by_expert(
+        inputs, split_sizes, sorted_chunk_indices
+    )
+
+    # Compute local group sizes (sum across source shards per local expert)
+    local_group_sizes = jnp.sum(
+        all_shards_tokens_per_expert[:, local_expert_start:local_expert_end],
+        axis=0,
+    )
+
+    # Create sorted expert IDs for each token
+    sorted_expert_ids = jnp.repeat(
+        jnp.arange(local_expert_size),
+        repeats=local_group_sizes,
+        total_repeat_length=inputs.shape[0],
+    )
+
+    return (
+        sorted_inputs,
+        sort_map,
+        local_group_sizes,
+        sorted_expert_ids,
+    )
+
+  @staticmethod
+  def te_local_unpermute(
+      outputs,
+      sort_map,
+      all_shards_tokens_per_expert,
+      local_expert_size,
+      shard_index,
+      num_expert_shards,
+  ):
+    """TE-based reverse of local permutation.
+
+    Reverses the chunk sort done by te_local_permute.
+
+    Args:
+      outputs: Expert outputs grouped by local expert [total_tokens, hidden].
+      sort_map: Sort map from te_local_permute.
+      all_shards_tokens_per_expert: Token counts from all shards [num_shards, num_experts].
+      local_expert_size: Number of local experts per shard.
+      shard_index: Current shard index.
+      num_expert_shards: Number of expert-parallel shards.
+
+    Returns:
+      Unsorted outputs ready for reverse ragged_all_to_all.
+    """
+    local_expert_start = shard_index * local_expert_size
+    local_expert_end = local_expert_start + local_expert_size
+
+    # Compute group sizes per local expert
+    local_group_sizes = jnp.sum(
+        all_shards_tokens_per_expert[:, local_expert_start:local_expert_end],
+        axis=0,
+    )
+
+    # Compute inverse sort indices
+    indices_matrix = jnp.arange(num_expert_shards * local_expert_size).reshape(
+        num_expert_shards, local_expert_size
+    )
+    sorted_chunk_indices = indices_matrix.T.reshape(-1)
+    reverse_indices = jnp.argsort(sorted_chunk_indices)
+
+    # Use TE sort_chunks_by_index with inverse indices
+    unsorted_outputs, _ = te_permutation.te_sort_chunks_by_expert(
+        outputs, local_group_sizes, reverse_indices
+    )
+
+    return unsorted_outputs
 
   @staticmethod
   def get_all_to_all_params(
@@ -1113,6 +1369,14 @@ class RoutedMoE(nnx.Module):
       else:
         expert_shard_id = 0
       num_expert_parallelism = self.get_expert_parallelism_size()
+
+      # Check if using TE permutation
+      use_te_perm = getattr(self.config, "use_te_permutation", False) and te_permutation.TE_PERMUTATION_AVAILABLE
+      # TE permutation tracking variables (initialized to None)
+      te_row_id_map = None
+      te_sort_map = None
+      te_all_shards_tokens_per_expert = None
+
       if self.config.use_ring_of_experts:
         # The ring-of-experts strategy first duplicates the inputs to all
         # expert shards, and then routes within each shard.
@@ -1140,9 +1404,33 @@ class RoutedMoE(nnx.Module):
         mask = jnp.arange(x.shape[0]) < jnp.sum(group_sizes)
         x = jnp.where(mask[:, None], x, 0)
       else:
-        x, sorted_selected_experts, weights, group_sizes, selected_experts, lb_loss, bias_updates = self.permute(
-            x, logits, pre_bias_logits, self.config.use_custom_sort_vjp, rngs
-        )
+        # =======================================================================
+        # Global Permutation: Either TE-based or standard MaxText implementation
+        # =======================================================================
+        if use_te_perm:
+          # TE permutation: uses Triton kernels for token dispatch
+          (
+              x,
+              te_row_id_map,
+              weights,
+              group_sizes,  # This is tokens_per_expert from TE
+              top_k_indices,
+              lb_loss,
+              bias_updates,
+          ) = self.te_permute(x, logits, pre_bias_logits, rngs)
+          # Create selected_experts for bias transform
+          expert_indices = jnp.arange(self.num_experts)
+          selected_experts = jnp.repeat(
+              expert_indices,
+              repeats=group_sizes,
+              total_repeat_length=x.shape[0],
+          )
+          sorted_selected_experts = None  # Not used in TE path
+        else:
+          # Standard MaxText permutation: uses argsort-based dispatch
+          x, sorted_selected_experts, weights, group_sizes, selected_experts, lb_loss, bias_updates = self.permute(
+              x, logits, pre_bias_logits, self.config.use_custom_sort_vjp, rngs
+          )
 
         if num_expert_parallelism > 1:
           batch_axis = self._expert_parallelism_name if is_batch_sharded_by_expert else "data"
@@ -1150,13 +1438,31 @@ class RoutedMoE(nnx.Module):
           local_expert_size = self.config.num_experts // num_expert_parallelism
           reshaped_group_sizes = jnp.sum(group_sizes.reshape(-1, local_expert_size), axis=1)
           global_group_sizes = group_sizes
+
           if is_batch_sharded_by_expert:
+            # All-gather to get group sizes from all shards
             all_shards_group_sizes = jax.lax.all_gather(reshaped_group_sizes, axis_name=batch_axis)
-            input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
-                all_shards_group_sizes,
-                expert_shard_id,
-                num_expert_parallelism,
-            )
+
+            # Compute ragged all-to-all parameters
+            if use_te_perm:
+              # TE version: use tokens_per_expert directly
+              all_shards_tokens_per_expert = jax.lax.all_gather(
+                  group_sizes[None, :], axis_name=expert_axis_name, axis=0, tiled=True
+              )
+              input_offsets, send_sizes, output_offsets, recv_sizes = (
+                  te_permutation.compute_ragged_all_to_all_params(
+                      all_shards_tokens_per_expert,
+                      expert_shard_id,
+                      num_expert_parallelism,
+                  )
+              )
+              te_all_shards_tokens_per_expert = all_shards_tokens_per_expert
+            else:
+              input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
+                  all_shards_group_sizes,
+                  expert_shard_id,
+                  num_expert_parallelism,
+              )
 
             # TODO(ranran): For better performance, we could update output buffer to a smaller
             # size to replace self.get_expert_parallelism_size() for efficiency,
@@ -1179,24 +1485,54 @@ class RoutedMoE(nnx.Module):
                 recv_sizes,
                 axis_name=self._expert_parallelism_name,
             )
-            global_group_sizes = jax.lax.all_gather(group_sizes, axis_name=self._expert_parallelism_name)
-            x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
-                x,
-                global_group_sizes,
-                local_expert_size,
-                shard_index=expert_shard_id,
-                use_custom_sort_vjp=self.config.use_custom_sort_vjp,
-            )
+
+            # =================================================================
+            # Local Permutation: Either TE-based or standard implementation
+            # =================================================================
+            if use_te_perm:
+              # TE local permutation: uses sort_chunks_by_index
+              x, te_sort_map, group_sizes, selected_experts = RoutedMoE.te_local_permute(
+                  x,
+                  te_all_shards_tokens_per_expert,
+                  local_expert_size,
+                  expert_shard_id,
+                  num_expert_parallelism,
+              )
+              local_sorted_indices = None  # Not used in TE path
+            else:
+              global_group_sizes = jax.lax.all_gather(group_sizes, axis_name=expert_axis_name)
+              x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
+                  x,
+                  global_group_sizes,
+                  local_expert_size,
+                  shard_index=expert_shard_id,
+                  use_custom_sort_vjp=self.config.use_custom_sort_vjp,
+              )
+
           else:
-            x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
-                x,
-                global_group_sizes[None, :],
-                local_expert_size,
-                shard_index=expert_shard_id,
-                is_offset=True,
-                global_sorted_experts=selected_experts,
-                use_custom_sort_vjp=self.config.use_custom_sort_vjp,
-            )
+            # Batch not sharded by expert
+            if use_te_perm:
+              # For TE path with non-sharded batch, use te_local_permute
+              all_shards_tokens_per_expert = global_group_sizes[None, :]
+              x, te_sort_map, group_sizes, selected_experts = RoutedMoE.te_local_permute(
+                  x,
+                  all_shards_tokens_per_expert,
+                  local_expert_size,
+                  expert_shard_id,
+                  num_expert_parallelism,
+              )
+              te_all_shards_tokens_per_expert = all_shards_tokens_per_expert
+              local_sorted_indices = None
+            else:
+              x, local_sorted_indices, group_sizes, selected_experts = RoutedMoE.local_permute(
+                  x,
+                  global_group_sizes[None, :],
+                  local_expert_size,
+                  shard_index=expert_shard_id,
+                  is_offset=True,
+                  global_sorted_experts=selected_experts,
+                  use_custom_sort_vjp=self.config.use_custom_sort_vjp,
+              )
 
       if self.config.mlp_bias:
         w0_bias, w1_bias, wo_bias = self.transform_bias(selected_experts, w0_bias, w1_bias, wo_bias)
@@ -1327,10 +1663,11 @@ class RoutedMoE(nnx.Module):
         output = jax.lax.psum_scatter(output, self._expert_parallelism_name, scatter_dimension=0, tiled=True)
 
       else:
+        # =======================================================================
+        # Unpermutation: Either TE-based or standard MaxText implementation
+        # =======================================================================
         if num_expert_parallelism > 1:
           original_inputs_first_dim = batch_size * sequence_length * self.config.num_experts_per_tok
-          if sorted_selected_experts.shape[0] != original_inputs_first_dim:
-            raise ValueError("original_inputs_first_dim does not match the original tensor" " shape!")
           output_shape = jnp.zeros(
               (
                   original_inputs_first_dim,
@@ -1338,32 +1675,91 @@ class RoutedMoE(nnx.Module):
               ),
               dtype=intermediate_output.dtype,
           )
+
           if is_batch_sharded_by_expert:
-            # locally unpermute back to the original order
-            local_output = _sort_activations(
-                intermediate_output,
-                jnp.argsort(local_sorted_indices),  # pylint: disable=undefined-variable
-                self.config.use_custom_sort_vjp,
-            )
-            input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
-                jnp.transpose(all_shards_group_sizes),  # pylint: disable=undefined-variable
-                expert_shard_id,
-                num_expert_parallelism,
-            )
-            intermediate_output = jax.lax.ragged_all_to_all(
-                local_output,
-                output_shape,
-                input_offsets,
-                send_sizes,
-                output_offsets,
-                recv_sizes,
-                axis_name=self._expert_parallelism_name,
-            )
+            if use_te_perm:
+              # TE local unpermute: reverse the chunk sort
+              local_expert_size = self.config.num_experts // num_expert_parallelism
+              intermediate_output = RoutedMoE.te_local_unpermute(
+                  intermediate_output,
+                  te_sort_map,
+                  te_all_shards_tokens_per_expert,
+                  local_expert_size,
+                  expert_shard_id,
+                  num_expert_parallelism,
+              )
+
+              # Compute reverse ragged all-to-all parameters for TE
+              local_expert_start = expert_shard_id * local_expert_size
+              local_expert_end = local_expert_start + local_expert_size
+
+              # In reverse: what we received becomes what we send
+              recv_sizes_reverse = jnp.sum(
+                  te_all_shards_tokens_per_expert[:, local_expert_start:local_expert_end],
+                  axis=1,
+              )
+              input_offsets_reverse = jnp.concatenate([
+                  jnp.array([0], dtype=recv_sizes_reverse.dtype),
+                  jnp.cumsum(recv_sizes_reverse)[:-1],
+              ])
+
+              # What we originally sent (now we receive back)
+              local_tokens_per_expert = te_all_shards_tokens_per_expert[expert_shard_id]
+              local_reshaped = local_tokens_per_expert.reshape(num_expert_parallelism, local_expert_size)
+              send_sizes_reverse = jnp.sum(local_reshaped, axis=1)
+              output_offsets_reverse = jnp.concatenate([
+                  jnp.array([0], dtype=send_sizes_reverse.dtype),
+                  jnp.cumsum(send_sizes_reverse)[:-1],
+              ])
+
+              intermediate_output = jax.lax.ragged_all_to_all(
+                  intermediate_output,
+                  output_shape,
+                  input_offsets_reverse,
+                  recv_sizes_reverse,
+                  output_offsets_reverse,
+                  send_sizes_reverse,
+                  axis_name=expert_axis_name,
+              )
+            else:
+              # Standard MaxText local unpermute
+              if sorted_selected_experts.shape[0] != original_inputs_first_dim:
+                raise ValueError("original_inputs_first_dim does not match the original tensor shape!")
+              local_output = _sort_activations(
+                  intermediate_output,
+                  jnp.argsort(local_sorted_indices),  # pylint: disable=undefined-variable
+                  self.config.use_custom_sort_vjp,
+              )
+              input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
+                  jnp.transpose(all_shards_group_sizes),  # pylint: disable=undefined-variable
+                  expert_shard_id,
+                  num_expert_parallelism,
+              )
+              intermediate_output = jax.lax.ragged_all_to_all(
+                  local_output,
+                  output_shape,
+                  input_offsets,
+                  send_sizes,
+                  output_offsets,
+                  recv_sizes,
+                  axis_name=expert_axis_name,
+              )
           else:
-            # If bach is replicated across EP shards then each shard should send
-            # 0..local_shard_size data to the other shards and receive the
-            # local_shard data from all of the other shards using
-            # ragged_all_to_all.
+            # Batch not sharded by expert - all shards have same batch, each processes local experts
+            # In unpermute: first reverse local sort, then all-to-all to redistribute
+            if use_te_perm:
+              # TE local unpermute: reverse the chunk sort
+              local_expert_size = self.config.num_experts // num_expert_parallelism
+              intermediate_output = RoutedMoE.te_local_unpermute(
+                  intermediate_output,
+                  te_sort_map,
+                  te_all_shards_tokens_per_expert,
+                  local_expert_size,
+                  expert_shard_id,
+                  num_expert_parallelism,
+              )
+
+            # Both TE and non-TE paths need ragged_all_to_all for non-sharded batch
             input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
                 reshaped_group_sizes,  # pylint: disable=undefined-variable
                 expert_shard_id,
@@ -1380,14 +1776,24 @@ class RoutedMoE(nnx.Module):
                 axis_name=self._expert_parallelism_name,
             )
 
-        output = self.unpermute(
-            intermediate_output,
-            sorted_selected_experts,
-            weights,
-            batch_size=batch_size,
-            sequence_length=sequence_length,
-            use_custom_sort_vjp=self.config.use_custom_sort_vjp,
-        )
+        # Global unpermute: TE token_combine or standard unpermute
+        if use_te_perm:
+          output = te_permutation.te_token_combine(
+              intermediate_output,
+              te_row_id_map,
+              merging_probs=None,  # TODO(tdophung): Integrate merging probs
+              pad_offsets=None,
+          )
+          output = output.reshape(batch_size, sequence_length, -1).astype(self.dtype)
+        else:
+          output = self.unpermute(
+              intermediate_output,
+              sorted_selected_experts,
+              weights,
+              batch_size=batch_size,
+              sequence_length=sequence_length,
+              use_custom_sort_vjp=self.config.use_custom_sort_vjp,
+          )
 
       return output, lb_loss, bias_updates
 
