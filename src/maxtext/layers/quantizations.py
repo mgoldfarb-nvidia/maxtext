@@ -948,3 +948,12 @@ class TransformerEngineQuantization(Quantization):
     """Placeholder for einsum implementation in subclasses."""
     import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
     return te_flax.make_einsum_cls(quantization_recipe=self._recipe)
+  
+  def gmm(self, inputs, kernel, tiling, group_sizes, expert_assignments):
+    """ Grouped GEMM """
+    import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+    return te_flax.make_ragged_dot_cls(quantization_recipe=self._recipe)(
+        inputs,
+        kernel,
+        group_sizes,
+    )
