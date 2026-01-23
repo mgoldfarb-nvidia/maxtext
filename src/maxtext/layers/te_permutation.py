@@ -95,6 +95,58 @@ def create_routing_map_from_indices(
   return routing_map
 
 
+def create_dense_probs_from_topk(
+    top_k_weights: jnp.ndarray,
+    top_k_indices: jnp.ndarray,
+    num_experts: int,
+) -> jnp.ndarray:
+  """Convert top-k weights to dense probability tensor for TE.
+
+  TE's token_dispatch expects probs of shape [num_tokens, num_experts] where
+  probs[i, j] = routing probability for token i to expert j (0 if not routed).
+
+  Args:
+    top_k_weights: Top-k routing weights of shape [batch, seq, num_experts_per_tok]
+                   or [num_tokens, num_experts_per_tok]. These are the softmax
+                   probabilities for the selected experts.
+    top_k_indices: Expert indices of shape [batch, seq, num_experts_per_tok]
+                   or [num_tokens, num_experts_per_tok].
+    num_experts: Total number of experts.
+
+  Returns:
+    dense_probs: Dense probability tensor of shape [num_tokens, num_experts].
+                 Non-selected experts have probability 0.
+  """
+  # Flatten to 2D if needed
+  original_shape = top_k_indices.shape
+  if top_k_indices.ndim == 3:
+    num_tokens = original_shape[0] * original_shape[1]
+    top_k_indices = top_k_indices.reshape(num_tokens, -1)
+    top_k_weights = top_k_weights.reshape(num_tokens, -1)
+  else:
+    num_tokens = top_k_indices.shape[0]
+
+  num_experts_per_tok = top_k_indices.shape[-1]
+
+  # Create one-hot encoding for each selected expert
+  # Shape: [num_tokens, num_experts_per_tok, num_experts]
+  one_hot = jax.nn.one_hot(top_k_indices, num_classes=num_experts, dtype=top_k_weights.dtype)
+
+  # Scale one-hot by weights: multiply each expert's one-hot by its weight
+  # top_k_weights shape: [num_tokens, num_experts_per_tok]
+  # Expand for broadcasting: [num_tokens, num_experts_per_tok, 1]
+  weights_expanded = top_k_weights[:, :, None]
+
+  # Element-wise multiply: [num_tokens, num_experts_per_tok, num_experts]
+  weighted_one_hot = one_hot * weights_expanded
+
+  # Sum across top-k dimension to get dense probs
+  # Shape: [num_tokens, num_experts]
+  dense_probs = jnp.sum(weighted_one_hot, axis=1)
+
+  return dense_probs
+
+
 def te_token_dispatch(
     inputs: jnp.ndarray,
     routing_map: jnp.ndarray,
