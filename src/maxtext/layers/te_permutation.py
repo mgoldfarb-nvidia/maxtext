@@ -177,19 +177,39 @@ def te_token_dispatch(
     permuted_probs: Permuted probabilities (or None).
     row_id_map: Mapping for token_combine.
     pad_offsets: Padding offsets if align_size provided (or None).
-    target_tokens_per_expert: Token counts per expert [num_experts].
+    tokens_per_expert: Token counts per expert [num_experts].
+                       Without padding: actual counts.
+                       With padding: aligned counts.
   """
   check_te_permutation_available()
 
   # Call TE token_dispatch
-  # tokens_per_expert is always returned (actual counts, not aligned)
-  output, permuted_probs, row_id_map, pad_offsets, tokens_per_expert = token_dispatch(
+  # tokens_per_expert is always returned (actual counts without padding,
+  # aligned counts with padding)
+  result = token_dispatch(
       inputs,
       routing_map,
       num_out_tokens=num_out_tokens,
       probs=probs,
       align_size=align_size,
   )
+
+  # Defensive unpacking with validation
+  if len(result) != 5:
+    raise ValueError(
+        f"Expected 5 return values from TE token_dispatch, got {len(result)}. "
+        f"Types: {[type(r).__name__ for r in result]}"
+    )
+
+  output, permuted_probs, row_id_map, pad_offsets, tokens_per_expert = result
+
+  # Validate tokens_per_expert is not None (should always be returned by TE >= latest)
+  if tokens_per_expert is None:
+    raise ValueError(
+        "TE token_dispatch returned None for tokens_per_expert. "
+        "Please ensure you have the latest TransformerEngine with the fix that "
+        "always returns tokens_per_expert. Try: pip install -e /path/to/TransformerEngine"
+    )
 
   return output, permuted_probs, row_id_map, pad_offsets, tokens_per_expert
 
@@ -271,7 +291,12 @@ def compute_ragged_all_to_all_params(
   local_expert_size = num_experts // num_expert_shards
 
   # Get this shard's token counts
-  local_tokens_per_expert = all_shards_tokens_per_expert[shard_id]
+  # Use dynamic_slice since shard_id may be a traced value (from jax.lax.axis_index)
+  local_tokens_per_expert = jax.lax.dynamic_slice(
+      all_shards_tokens_per_expert,
+      start_indices=(shard_id, 0),
+      slice_sizes=(1, num_experts)
+  ).squeeze(0)
 
   # Reshape to [num_expert_shards, local_expert_size]
   local_reshaped = local_tokens_per_expert.reshape(num_expert_shards, local_expert_size)
@@ -289,13 +314,17 @@ def compute_ragged_all_to_all_params(
   # We need tokens that shard i has for our local experts
   # Our local experts are [shard_id * local_expert_size : (shard_id+1) * local_expert_size]
   local_expert_start = shard_id * local_expert_size
-  local_expert_end = local_expert_start + local_expert_size
+
+  # Use dynamic_slice since shard_id may be a traced value (from jax.lax.axis_index)
+  # Extract columns [local_expert_start : local_expert_start + local_expert_size]
+  local_expert_columns = jax.lax.dynamic_slice(
+      all_shards_tokens_per_expert,
+      start_indices=(0, local_expert_start),
+      slice_sizes=(all_shards_tokens_per_expert.shape[0], local_expert_size)
+  )
 
   # For each source shard, sum tokens destined for our experts
-  recv_sizes = jnp.sum(
-      all_shards_tokens_per_expert[:, local_expert_start:local_expert_end],
-      axis=1
-  )
+  recv_sizes = jnp.sum(local_expert_columns, axis=1)
 
   # output_offsets: where to place received tokens from each shard
   output_offsets = jnp.concatenate([
