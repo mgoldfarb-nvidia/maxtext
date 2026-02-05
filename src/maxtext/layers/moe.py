@@ -50,18 +50,23 @@ set_xla_metadata = xla_metadata.set_xla_metadata
 DISPATCH = "dispatch"
 COMBINE = "combine"
 
-# Debug flag for MoE permutation debugging
-# Set to True to enable detailed logging of intermediate values
-MOE_PERM_DEBUG = False
+# =============================================================================
+# Debug Flags for MoE Permutation
+# =============================================================================
+# WARNING: MOE_PERM_DEBUG uses jax.debug.print() which DOES NOT WORK on multi-GPU!
+# Only use MOE_PERM_DEBUG=True for single-GPU debugging.
+# For multi-GPU (EP > 1), use MOE_DEBUG_DUMP_TENSOR instead.
+# =============================================================================
+MOE_PERM_DEBUG = False  # WARNING: Only works on single GPU!
 
 # =============================================================================
-# Tensor Dumping for Multi-GPU Debugging
+# Tensor Dumping for Multi-GPU Debugging (RECOMMENDED for EP > 1)
 # =============================================================================
-# jax.debug.print() has bugs on multiple GPUs. Use te_inspect_array instead,
-# which dumps tensors to binary files (my_tensor_gpuX.bin).
+# Use te_inspect_array to dump tensors to binary files (my_tensor_gpuX.bin).
+# This works around jax.debug.print() bugs on multiple GPUs.
 #
 # Set MOE_DEBUG_DUMP_TENSOR to the name of the tensor you want to dump.
-# Available tensor names (matching _debug_log_array calls):
+# Available tensor names:
 #   - "after_te_permute_x", "after_mt_permute_x"
 #   - "after_ragged_all_to_all_fwd_x"
 #   - "after_te_local_permute_x", "after_mt_local_permute_x"
@@ -103,16 +108,14 @@ except ImportError:
 #   - Local permute (te_local_permute vs local_permute) - within-shard reordering
 #   - Local unpermute (te_local_unpermute vs MT argsort) - reverse within-shard reorder
 #
-# Example configurations:
+# Example configurations for isolation testing:
 #   - Both None: Follow config.use_te_permutation for all operations
+#   - Both "te": Force TE implementation for everything
+#   - Both "mt": Force MT implementation for everything
 #   - MOE_DEBUG_GLOBAL_PERM_MODE = "te", MOE_DEBUG_LOCAL_PERM_MODE = "mt":
-#       Uses TE for global permute/unpermute, MT for local permute/unpermute
+#       Test if global TE permute is the issue vs local MT permute
 #   - MOE_DEBUG_GLOBAL_PERM_MODE = "mt", MOE_DEBUG_LOCAL_PERM_MODE = "te":
-#       Uses MT for global permute/unpermute, TE for local permute/unpermute
-#
-# Note: Mixing implementations may require compatible state. The global permute
-# produces state (e.g., te_row_id_map vs sorted_selected_experts) that must be
-# consistent with the unpermute operation used.
+#       Test if local TE permute is the issue vs global MT permute
 # =============================================================================
 MOE_DEBUG_GLOBAL_PERM_MODE = None  # None, "te", or "mt"
 MOE_DEBUG_LOCAL_PERM_MODE = None   # None, "te", or "mt"
@@ -140,31 +143,12 @@ def _get_effective_perm_mode(config_use_te: bool, debug_mode: str | None) -> boo
 def _debug_log_array(name: str, arr: jnp.ndarray, shard_id: int = 0):
   """Log array statistics for debugging MoE permutation.
   
-  When MOE_PERM_DEBUG is True, logs statistics using jax.debug.print.
-  Note: jax.debug.print has bugs on multi-GPU, use MOE_DEBUG_DUMP_TENSOR instead.
+  NOTE: This function is disabled because jax.debug.print does NOT work on multi-GPU.
+  Use MOE_DEBUG_DUMP_TENSOR with te_inspect_array instead for multi-GPU debugging.
   """
-  if not MOE_PERM_DEBUG:
-    return
-  
-  def _log_fn(name, arr, shard_id):
-    checksum = jnp.sum(arr.astype(jnp.float32))
-    mean_val = jnp.mean(arr.astype(jnp.float32))
-    max_val = jnp.max(arr.astype(jnp.float32))
-    min_val = jnp.min(arr.astype(jnp.float32))
-    jax.debug.print(
-        "[MOE_DEBUG] shard={shard_id} {name}: shape={shape}, dtype={dtype}, "
-        "sum={checksum:.4f}, mean={mean:.4f}, min={min_val:.4f}, max={max_val:.4f}",
-        shard_id=shard_id,
-        name=name,
-        shape=arr.shape,
-        dtype=arr.dtype,
-        checksum=checksum,
-        mean=mean_val,
-        min_val=min_val,
-        max_val=max_val,
-    )
-  
-  _log_fn(name, arr, shard_id)
+  # Disabled - jax.debug.print causes SPMD partitioning errors on multi-GPU
+  # Use MOE_DEBUG_DUMP_TENSOR instead
+  pass
 
 
 def _debug_dump_array(name: str, arr: jnp.ndarray) -> jnp.ndarray:
@@ -196,52 +180,24 @@ def _debug_dump_array(name: str, arr: jnp.ndarray) -> jnp.ndarray:
 
 
 def _debug_log_sizes(name: str, arr: jnp.ndarray, shard_id: int = 0):
-  """Log size/count arrays (like group_sizes, send_sizes) for debugging."""
-  if not MOE_PERM_DEBUG:
-    return
+  """Log size/count arrays (like group_sizes, send_sizes) for debugging.
   
-  jax.debug.print(
-      "[MOE_DEBUG] shard={shard_id} {name}: {arr}",
-      shard_id=shard_id,
-      name=name,
-      arr=arr,
-  )
+  NOTE: This function is disabled because jax.debug.print does NOT work on multi-GPU.
+  Use MOE_DEBUG_DUMP_TENSOR with te_inspect_array instead for multi-GPU debugging.
+  """
+  # Disabled - jax.debug.print causes SPMD partitioning errors on multi-GPU
+  # Use MOE_DEBUG_DUMP_TENSOR instead
+  pass
 
 
 def _debug_grad_hook(name: str, shard_id: int = 0):
   """Create a gradient logging hook for debugging backward pass.
   
-  Usage: x = _debug_grad_hook("my_var", shard_id)(x)
-  This logs the gradient norm during the backward pass.
+  NOTE: This function is disabled because jax.debug.print does NOT work on multi-GPU.
+  Returns identity function. Use MOE_DEBUG_DUMP_TENSOR for multi-GPU debugging.
   """
-  if not MOE_PERM_DEBUG:
-    return lambda x: x
-  
-  @jax.custom_vjp
-  def identity_with_grad_log(x):
-    return x
-  
-  def fwd(x):
-    return x, None
-  
-  def bwd(_, g):
-    grad_norm = jnp.sqrt(jnp.sum(g.astype(jnp.float32) ** 2))
-    grad_sum = jnp.sum(g.astype(jnp.float32))
-    grad_max = jnp.max(jnp.abs(g.astype(jnp.float32)))
-    jax.debug.print(
-        "[MOE_GRAD_DEBUG] shard={shard_id} {name}_grad: shape={shape}, "
-        "norm={norm:.6f}, sum={grad_sum:.6f}, max_abs={max_abs:.6f}",
-        shard_id=shard_id,
-        name=name,
-        shape=g.shape,
-        norm=grad_norm,
-        grad_sum=grad_sum,
-        max_abs=grad_max,
-    )
-    return (g,)
-  
-  identity_with_grad_log.defvjp(fwd, bwd)
-  return identity_with_grad_log
+  # Disabled - jax.debug.print causes SPMD partitioning errors on multi-GPU
+  return lambda x: x
 
 
 def _sort_activations(
@@ -1600,17 +1556,9 @@ class RoutedMoE(nnx.Module):
       config_use_te_perm = getattr(self.config, "use_te_permutation", False) and te_permutation.TE_PERMUTATION_AVAILABLE
       
       # Apply isolation testing overrides if configured
-      # These allow mixing TE and MT implementations for debugging
+      # Mixed modes are supported for debugging - state variables are computed for both paths
       use_te_global_perm = _get_effective_perm_mode(config_use_te_perm, MOE_DEBUG_GLOBAL_PERM_MODE)
       use_te_local_perm = _get_effective_perm_mode(config_use_te_perm, MOE_DEBUG_LOCAL_PERM_MODE)
-      
-      # Log isolation testing mode if enabled
-      if MOE_PERM_DEBUG and (MOE_DEBUG_GLOBAL_PERM_MODE is not None or MOE_DEBUG_LOCAL_PERM_MODE is not None):
-        jax.debug.print(
-            "[MOE_DEBUG] Isolation testing: global_perm={global_mode}, local_perm={local_mode}",
-            global_mode="TE" if use_te_global_perm else "MT",
-            local_mode="TE" if use_te_local_perm else "MT",
-        )
       
       # TE permutation tracking variables (initialized to None)
       te_row_id_map = None
@@ -1667,7 +1615,10 @@ class RoutedMoE(nnx.Module):
               repeats=group_sizes,
               total_repeat_length=x.shape[0],
           )
-          sorted_selected_experts = None  # Not used in TE path
+          # Compute sorted_selected_experts for mixed mode support (TE global + MT local)
+          # This is the sort order, same as MT's jnp.argsort(flatten_selected_experts)
+          flatten_selected_experts = jnp.ravel(top_k_indices)
+          sorted_selected_experts = jnp.argsort(flatten_selected_experts)
           # Debug logging after te_permute
           _debug_log_array("after_te_permute_x", x, expert_shard_id)
           _debug_log_sizes("after_te_permute_group_sizes", group_sizes, expert_shard_id)
@@ -1701,19 +1652,21 @@ class RoutedMoE(nnx.Module):
 
             # Compute ragged all-to-all parameters
             # Note: This follows global perm mode since it handles communication of globally permuted data
+            # Always compute te_all_shards_tokens_per_expert for mixed mode support
+            # This is needed by TE local permute even when using MT global
+            te_all_shards_tokens_per_expert = jax.lax.all_gather(
+                group_sizes[None, :], axis_name=expert_axis_name, axis=0, tiled=True
+            )
+            
             if use_te_global_perm:
               # TE version: use tokens_per_expert directly
-              all_shards_tokens_per_expert = jax.lax.all_gather(
-                  group_sizes[None, :], axis_name=expert_axis_name, axis=0, tiled=True
-              )
               input_offsets, send_sizes, output_offsets, recv_sizes = (
                   te_permutation.compute_ragged_all_to_all_params(
-                      all_shards_tokens_per_expert,
+                      te_all_shards_tokens_per_expert,
                       expert_shard_id,
                       num_expert_parallelism,
                   )
               )
-              te_all_shards_tokens_per_expert = all_shards_tokens_per_expert
               # Debug logging for TE ragged_all_to_all params
               _debug_log_sizes("TE_send_sizes", send_sizes, expert_shard_id)
               _debug_log_sizes("TE_recv_sizes", recv_sizes, expert_shard_id)
