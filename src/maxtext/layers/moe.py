@@ -80,8 +80,10 @@ MOE_PERM_DEBUG = False  # WARNING: Only works on single GPU!
 #   data = load_array_dump("my_tensor_gpu0.bin", (batch, seq, dim), jnp.bfloat16)
 #
 # Note: Each call overwrites the same file, so only set ONE tensor name at a time.
+# Set MOE_DEBUG_DUMP_ONCE=True to only dump on the first call (avoids backward pass overwriting).
 # =============================================================================
 MOE_DEBUG_DUMP_TENSOR = None  # e.g., "after_te_permute_x" or None to disable
+MOE_DEBUG_DUMP_ONCE = True    # If True, only dump on first call (forward pass)
 
 # Try to import te_inspect_array for multi-GPU debugging
 try:
@@ -151,6 +153,14 @@ def _debug_log_array(name: str, arr: jnp.ndarray, shard_id: int = 0):
   pass
 
 
+# Track whether we've already dumped (to avoid backward pass overwriting forward pass)
+_debug_dump_already_called = set()
+
+def _debug_reset_dump_state():
+  """Reset the dump state to allow dumping again. Call between runs if needed."""
+  global _debug_dump_already_called
+  _debug_dump_already_called.clear()
+
 def _debug_dump_array(name: str, arr: jnp.ndarray) -> jnp.ndarray:
   """Dump array to file for multi-GPU debugging using te_inspect_array.
   
@@ -167,12 +177,21 @@ def _debug_dump_array(name: str, arr: jnp.ndarray) -> jnp.ndarray:
   Returns:
     The array (possibly passed through te_inspect_array)
   """
+  global _debug_dump_already_called
+  
   if MOE_DEBUG_DUMP_TENSOR is None or MOE_DEBUG_DUMP_TENSOR != name:
+    return arr
+  
+  # If MOE_DEBUG_DUMP_ONCE is set, only dump on first call
+  if MOE_DEBUG_DUMP_ONCE and name in _debug_dump_already_called:
     return arr
   
   if not TE_INSPECT_AVAILABLE:
     print(f"[MOE_DEBUG] Warning: te_inspect_array not available, cannot dump {name}")
     return arr
+  
+  # Mark as called
+  _debug_dump_already_called.add(name)
   
   # Use te_inspect_array to dump the tensor to file
   # Must re-assign to prevent XLA from optimizing out the call
