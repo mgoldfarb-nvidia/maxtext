@@ -1186,8 +1186,8 @@ class RoutedMoE(nnx.Module):
     split_sizes = local_expert_columns.reshape(-1)
 
     # Compute the actual token count (sum of split_sizes)
-    # This is used to mask out garbage produced by the kernel for buffer positions
-    # beyond the valid token range.
+    # This represents the total number of valid tokens in the input buffer
+    # (sum of tokens from all source shards for all local experts).
     actual_token_count = jnp.sum(split_sizes)
 
     # Create sort indices to reorder from (shard, expert) to (expert, shard)
@@ -1199,17 +1199,14 @@ class RoutedMoE(nnx.Module):
     sorted_chunk_indices = indices_matrix.T.reshape(-1)
 
     # Use TE sort_chunks_by_index
-    # NOTE: The kernel produces garbage for positions >= sum(split_sizes)
-    # because it assumes inputs.shape[0] == sum(split_sizes).
-    sorted_inputs_raw, sort_map = te_permutation.te_sort_chunks_by_expert(
+    # NOTE: With the kernel fix, tokens beyond sum(split_sizes) map to themselves
+    # (identity mapping) to avoid corrupting valid data.
+    sorted_inputs, sort_map = te_permutation.te_sort_chunks_by_expert(
         inputs, split_sizes, sorted_chunk_indices
     )
-
-    # CRITICAL FIX: Mask out garbage data beyond the valid token range.
-    # The kernel produces garbage for buffer positions >= actual_token_count.
-    # We create a mask to zero out these positions.
-    valid_mask = jnp.arange(inputs.shape[0]) < actual_token_count
-    sorted_inputs = jnp.where(valid_mask[:, None], sorted_inputs_raw, 0)
+    
+    # Note: The kernel now handles out-of-bounds tokens correctly via identity mapping.
+    # No additional masking is needed here.
 
     # Compute local group sizes (sum across source shards per local expert)
     local_group_sizes = jnp.sum(local_expert_columns, axis=0)
@@ -1570,6 +1567,11 @@ class RoutedMoE(nnx.Module):
     if isinstance(wo_kernel, aqt.QTensor):
       wo_pspec = aqt.partition_spec(wo_pspec, (1,), wo_kernel.dtype, use_bias=False)
 
+    # DEBUG: Print mesh configuration (runs once during tracing, safe for multi-GPU)
+    # Comment out after debugging
+    print(f"DEBUG MESH CONFIG: axis_names={self.mesh.axis_names}, shape={self.mesh.shape}")
+    print(f"DEBUG MESH CONFIG: num_expert_parallelism={self.get_expert_parallelism_size()}")
+
     @functools.partial(
         jax.shard_map,
         mesh=self.mesh,
@@ -1722,6 +1724,16 @@ class RoutedMoE(nnx.Module):
               _debug_log_sizes("TE_recv_sizes", recv_sizes, expert_shard_id)
               _debug_log_sizes("TE_input_offsets", input_offsets, expert_shard_id)
               _debug_log_sizes("TE_output_offsets", output_offsets, expert_shard_id)
+              # DEBUG: Dump ragged_all_to_all params using te_inspect_array (safe for multi-GPU)
+              # Set MOE_DEBUG_DUMP_TENSOR = "te_ragged_params" to enable
+              if TE_INSPECT_AVAILABLE and MOE_DEBUG_DUMP_TENSOR == "te_ragged_params":
+                send_sizes = te_inspect_array(send_sizes, "te_send_sizes")
+                recv_sizes = te_inspect_array(recv_sizes, "te_recv_sizes")
+                input_offsets = te_inspect_array(input_offsets, "te_input_offsets")
+                output_offsets = te_inspect_array(output_offsets, "te_output_offsets")
+                te_all_shards_tokens_per_expert = te_inspect_array(
+                    te_all_shards_tokens_per_expert, "te_all_shards_tokens_per_expert"
+                )
             else:
               input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
                   all_shards_group_sizes,
