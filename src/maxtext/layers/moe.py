@@ -1381,10 +1381,7 @@ class RoutedMoE(nnx.Module):
     def gmm(
         inputs, kernel, tiling, group_sizes, expert_assignments, weight_gather_axes, input_buffer_count, combine_scopes
     ):
-      if self.config.quantization.startswith("te_"):
-        assert not self.config.megablox, "Megablox not supported with TE quantization."
-        assert not self.config.use_tokamax_gmm, "Tokamax GMM not supported with TE quantization."
-        return self.quant.gmm(inputs, kernel, tiling, group_sizes, expert_assignments)
+      use_te_gmm = self.config.quantization and self.config.quantization.startswith("te_")
       # TODO (b/491979205) pipeline fsdp ag per repeat fails tokamax gmm
       if self.config.using_pipeline_parallelism and self.config.pipeline_fsdp_ag_per_repeat:
         tokamax_group_sizes = group_sizes
@@ -1408,11 +1405,12 @@ class RoutedMoE(nnx.Module):
       kernel = kernel.astype(self.dtype)
 
       lhs_quantize_dtype, rhs_quantize_dtype = None, None
-      if self.quant is not None and hasattr(self.quant, 'quant_dg'):
+      if self.quant is not None and hasattr(self.quant, 'quant_dg') and not use_te_gmm:
         quant_dg = self.quant.quant_dg
         lhs_quantize_dtype = quant_dg.fwd.dg_quantizer.lhs.numerics.get_dtype()
         rhs_quantize_dtype = quant_dg.fwd.dg_quantizer.rhs.numerics.get_dtype()
       m, k, n = inputs.shape[0], inputs.shape[1], kernel.shape[2]
+      assert not use_te_gmm or (not self.config.megablox and not self.config.use_tokamax_gmm), "TE GMM is only supported when Megablox and Tokamax GMM are disabled."
       if not self.config.megablox and not self.config.use_tokamax_gmm:
         tiling = (
             min(tiling[0], m),
@@ -1468,20 +1466,22 @@ class RoutedMoE(nnx.Module):
             # Use full contraction for QWIX quantization to allow quantization
             # fusion (max reduce over contracting dimension).
             tiling = (tiling[0], k, tiling[2])
-
-          is_tpu = self.mesh.devices.flat[0] == "tpu"
-          # TPU needs random mosaic_fusion_group; GPU/CPU needs deterministic ID for autotuner sync
-          mosaic_group_id = f"{random.randint(0, 1000000000)}" if is_tpu else "0"
-          with set_xla_metadata(
-              ragged_dot_tiling=",".join([str(t) for t in tiling]),
-              mosaic_fusion_group=mosaic_group_id,
-          ):
-            output = jax.lax.ragged_dot(
-                lhs=inputs,
-                rhs=rhs_inputs,
-                group_sizes=group_sizes,
-                preferred_element_type=self.dtype,
-            )
+          if use_te_gmm and False:
+            return self.quant.gmm(inputs, kernel, tiling, group_sizes, expert_assignments)
+          else:
+            is_tpu = self.mesh.devices.flat[0] == "tpu"
+            # TPU needs random mosaic_fusion_group; GPU/CPU needs deterministic ID for autotuner sync
+            mosaic_group_id = f"{random.randint(0, 1000000000)}" if is_tpu else "0"
+            with set_xla_metadata(
+                ragged_dot_tiling=",".join([str(t) for t in tiling]),
+                mosaic_fusion_group=mosaic_group_id,
+            ):
+              output = jax.lax.ragged_dot(
+                  lhs=inputs,
+                  rhs=rhs_inputs,
+                  group_sizes=group_sizes,
+                  preferred_element_type=self.dtype,
+              )
           if isinstance(kernel, aqt.QTensor):
             # Multiply outputs by the kernely scale
             scales = jnp.take(kernel.scale[0].squeeze(), indices=expert_assignments, axis=0)
