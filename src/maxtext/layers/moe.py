@@ -50,180 +50,6 @@ set_xla_metadata = xla_metadata.set_xla_metadata
 DISPATCH = "dispatch"
 COMBINE = "combine"
 
-# =============================================================================
-# Debug Flags for MoE Permutation
-# =============================================================================
-# WARNING: MOE_PERM_DEBUG uses jax.debug.print() which DOES NOT WORK on multi-GPU!
-# Only use MOE_PERM_DEBUG=True for single-GPU debugging.
-# For multi-GPU (EP > 1), use MOE_DEBUG_DUMP_TENSOR instead.
-# =============================================================================
-MOE_PERM_DEBUG = False  # WARNING: Only works on single GPU!
-
-# =============================================================================
-# Tensor Dumping for Multi-GPU Debugging (RECOMMENDED for EP > 1)
-# =============================================================================
-# Use te_inspect_array to dump tensors to binary files (my_tensor_gpuX.bin).
-# This works around jax.debug.print() bugs on multiple GPUs.
-#
-# Set MOE_DEBUG_DUMP_TENSOR to the name of the tensor you want to dump.
-# Available tensor names:
-#   - "after_te_permute_x", "after_mt_permute_x"
-#   - "after_ragged_all_to_all_fwd_x"
-#   - "after_te_local_permute_x", "after_mt_local_permute_x"
-#   - "after_gmm_intermediate_output"
-#   - "after_te_local_unpermute", "after_mt_local_unpermute"
-#   - "after_te_ragged_all_to_all_rev", "after_mt_ragged_all_to_all_rev"
-#   - "after_te_unpermute_output", "after_mt_unpermute_output"
-#
-# To load the dumped tensor:
-#   from transformer_engine.jax.inspect import load_array_dump
-#   data = load_array_dump("my_tensor_gpu0.bin", (batch, seq, dim), jnp.bfloat16)
-#
-# Note: Each call overwrites the same file, so only set ONE tensor name at a time.
-# Set MOE_DEBUG_DUMP_ONCE=True to only dump on the first call (avoids backward pass overwriting).
-# =============================================================================
-MOE_DEBUG_DUMP_TENSOR = None
-MOE_DEBUG_DUMP_ONCE = False    # If True, only dump on first call (forward pass)
-
-# Try to import te_inspect_array for multi-GPU debugging
-try:
-  from transformer_engine.jax.inspect import inspect_array as te_inspect_array
-  TE_INSPECT_AVAILABLE = True
-except ImportError:
-  TE_INSPECT_AVAILABLE = False
-  te_inspect_array = None
-
-# DEBUG: Print import status and dump settings at module load time (comment out after debugging)
-print(f"[MOE DEBUG] TE_INSPECT_AVAILABLE = {TE_INSPECT_AVAILABLE}, MOE_DEBUG_DUMP_TENSOR = {MOE_DEBUG_DUMP_TENSOR}")
-
-# =============================================================================
-# Isolation Testing Knobs for MoE Permutation
-# =============================================================================
-# These allow mixing TE and MT implementations for debugging purposes.
-# When set to None, the behavior follows the config's use_te_permutation setting.
-# When set to "te" or "mt", it forces that implementation regardless of config.
-#
-# MOE_DEBUG_GLOBAL_PERM_MODE controls:
-#   - Global permute (te_permute vs permute) - token dispatch to experts
-#   - Global unpermute (te_unpermute vs unpermute) - token combine from experts
-#   - ragged_all_to_all parameter computation (TE vs MT method)
-#   - Buffer sizing for padding (TE alignment overhead)
-#
-# MOE_DEBUG_LOCAL_PERM_MODE controls:
-#   - Local permute (te_local_permute vs local_permute) - within-shard reordering
-#   - Local unpermute (te_local_unpermute vs MT argsort) - reverse within-shard reorder
-#
-# Example configurations for isolation testing:
-#   - Both None: Follow config.use_te_permutation for all operations
-#   - Both "te": Force TE implementation for everything
-#   - Both "mt": Force MT implementation for everything
-#   - MOE_DEBUG_GLOBAL_PERM_MODE = "te", MOE_DEBUG_LOCAL_PERM_MODE = "mt":
-#       Test if global TE permute is the issue vs local MT permute
-#   - MOE_DEBUG_GLOBAL_PERM_MODE = "mt", MOE_DEBUG_LOCAL_PERM_MODE = "te":
-#       Test if local TE permute is the issue vs global MT permute
-# =============================================================================
-MOE_DEBUG_GLOBAL_PERM_MODE = "te"
-MOE_DEBUG_LOCAL_PERM_MODE = "te"
-
-
-def _get_effective_perm_mode(config_use_te: bool, debug_mode: str | None) -> bool:
-  """Determine effective permutation mode based on config and debug override.
-  
-  Args:
-    config_use_te: The config's use_te_permutation setting
-    debug_mode: Debug override - None, "te", or "mt"
-    
-  Returns:
-    True if TE implementation should be used, False for MT
-  """
-  if debug_mode is None:
-    return config_use_te
-  elif debug_mode == "te":
-    return True
-  elif debug_mode == "mt":
-    return False
-  else:
-    raise ValueError(f"Invalid debug_mode: {debug_mode}. Must be None, 'te', or 'mt'")
-
-def _debug_log_array(name: str, arr: jnp.ndarray, shard_id: int = 0):
-  """Log array statistics for debugging MoE permutation.
-  
-  NOTE: This function is disabled because jax.debug.print does NOT work on multi-GPU.
-  Use MOE_DEBUG_DUMP_TENSOR with te_inspect_array instead for multi-GPU debugging.
-  """
-  # Disabled - jax.debug.print causes SPMD partitioning errors on multi-GPU
-  # Use MOE_DEBUG_DUMP_TENSOR instead
-  pass
-
-
-# Track whether we've already dumped (to avoid backward pass overwriting forward pass)
-_debug_dump_already_called = set()
-
-def _debug_reset_dump_state():
-  """Reset the dump state to allow dumping again. Call between runs if needed."""
-  global _debug_dump_already_called
-  _debug_dump_already_called.clear()
-
-def _debug_dump_array(name: str, arr: jnp.ndarray) -> jnp.ndarray:
-  """Dump array to file for multi-GPU debugging using te_inspect_array.
-  
-  This is a workaround for jax.debug.print() bugs on multiple GPUs.
-  The array is dumped to my_tensor_gpuX.bin where X is the GPU ID.
-  
-  IMPORTANT: You must re-assign the return value to ensure XLA doesn't optimize out the call.
-  Example: arr = _debug_dump_array("my_tensor", arr)
-  
-  Args:
-    name: Name of the tensor (for matching against MOE_DEBUG_DUMP_TENSOR)
-    arr: The array to potentially dump
-    
-  Returns:
-    The array (possibly passed through te_inspect_array)
-  """
-  global _debug_dump_already_called
-  
-  if MOE_DEBUG_DUMP_TENSOR is None or MOE_DEBUG_DUMP_TENSOR != name:
-    return arr
-  
-  # If MOE_DEBUG_DUMP_ONCE is set, only dump on first call
-  if MOE_DEBUG_DUMP_ONCE and name in _debug_dump_already_called:
-    return arr
-  
-  if not TE_INSPECT_AVAILABLE:
-    print(f"[MOE_DEBUG] Warning: te_inspect_array not available, cannot dump {name}")
-    return arr
-  
-  # Mark as called
-  _debug_dump_already_called.add(name)
-  
-  # DEBUG: Print that we're about to dump (this runs at trace time, not runtime)
-  print(f"[MOE_DEBUG] Calling te_inspect_array for '{name}', shape={arr.shape}, dtype={arr.dtype}")
-
-  # Use te_inspect_array to dump the tensor to file
-  # Must re-assign to prevent XLA from optimizing out the call
-  return te_inspect_array(arr, name)
-
-
-def _debug_log_sizes(name: str, arr: jnp.ndarray, shard_id: int = 0):
-  """Log size/count arrays (like group_sizes, send_sizes) for debugging.
-  
-  NOTE: This function is disabled because jax.debug.print does NOT work on multi-GPU.
-  Use MOE_DEBUG_DUMP_TENSOR with te_inspect_array instead for multi-GPU debugging.
-  """
-  # Disabled - jax.debug.print causes SPMD partitioning errors on multi-GPU
-  # Use MOE_DEBUG_DUMP_TENSOR instead
-  pass
-
-
-def _debug_grad_hook(name: str, shard_id: int = 0):
-  """Create a gradient logging hook for debugging backward pass.
-  
-  NOTE: This function is disabled because jax.debug.print does NOT work on multi-GPU.
-  Returns identity function. Use MOE_DEBUG_DUMP_TENSOR for multi-GPU debugging.
-  """
-  # Disabled - jax.debug.print causes SPMD partitioning errors on multi-GPU
-  return lambda x: x
-
 
 def _sort_activations(
     inputs: jax.Array,
@@ -1573,11 +1399,6 @@ class RoutedMoE(nnx.Module):
     if isinstance(wo_kernel, aqt.QTensor):
       wo_pspec = aqt.partition_spec(wo_pspec, (1,), wo_kernel.dtype, use_bias=False)
 
-    # DEBUG: Print mesh configuration (runs once during tracing, safe for multi-GPU)
-    # Comment out after debugging
-    print(f"DEBUG MESH CONFIG: axis_names={self.mesh.axis_names}, shape={self.mesh.shape}")
-    print(f"DEBUG MESH CONFIG: num_expert_parallelism={self.get_expert_parallelism_size()}")
-
     @functools.partial(
         jax.shard_map,
         mesh=self.mesh,
@@ -1612,10 +1433,9 @@ class RoutedMoE(nnx.Module):
       # Check if using TE permutation (base config setting)
       config_use_te_perm = getattr(self.config, "use_te_permutation", False) and te_permutation.TE_PERMUTATION_AVAILABLE
       
-      # Apply isolation testing overrides if configured
-      # Mixed modes are supported for debugging - state variables are computed for both paths
-      use_te_global_perm = _get_effective_perm_mode(config_use_te_perm, MOE_DEBUG_GLOBAL_PERM_MODE)
-      use_te_local_perm = _get_effective_perm_mode(config_use_te_perm, MOE_DEBUG_LOCAL_PERM_MODE)
+      # Use TE permutation if configured
+      use_te_global_perm = config_use_te_perm
+      use_te_local_perm = config_use_te_perm
       
       # TE permutation tracking variables (initialized to None)
       te_row_id_map = None
@@ -1677,30 +1497,14 @@ class RoutedMoE(nnx.Module):
           # This is the sort order, same as MT's jnp.argsort(flatten_selected_experts)
           flatten_selected_experts = jnp.ravel(top_k_indices)
           sorted_selected_experts = jnp.argsort(flatten_selected_experts)
-          # Debug logging after te_permute
-          _debug_log_array("after_te_permute_x", x, expert_shard_id)
-          _debug_log_sizes("after_te_permute_group_sizes", group_sizes, expert_shard_id)
-          # Dump tensor to file if requested (for multi-GPU debugging)
-          x = _debug_dump_array("after_te_permute_x", x)
-          # Gradient hook for backward pass debugging
-          x = _debug_grad_hook("after_te_permute_x", expert_shard_id)(x)
         else:
           # Standard MaxText permutation: uses argsort-based dispatch
           x, sorted_selected_experts, weights, group_sizes, selected_experts, lb_loss, bias_updates = self.permute(
               x, logits, pre_bias_logits, self.config.use_custom_sort_vjp, rngs
           )
-          # Debug logging after MT permute
-          _debug_log_array("after_mt_permute_x", x, expert_shard_id)
-          _debug_log_sizes("after_mt_permute_group_sizes", group_sizes, expert_shard_id)
-          # Dump tensor to file if requested (for multi-GPU debugging)
-          x = _debug_dump_array("after_mt_permute_x", x)
-          # Gradient hook for backward pass debugging
-          x = _debug_grad_hook("after_mt_permute_x", expert_shard_id)(x)
 
         if num_expert_parallelism > 1:
-          batch_axis = self._expert_parallelism_name if is_batch_sharded_by_expert else "data"
-          # DEBUG: Print condition values (comment out after debugging)
-          print(f"[MOE DEBUG RUNTIME] num_expert_parallelism={num_expert_parallelism}, is_batch_sharded_by_expert={is_batch_sharded_by_expert}, use_te_global_perm={use_te_global_perm}")
+          batch_axis = "expert" if is_batch_sharded_by_expert else "data"
           # get group sizes for all shards
           local_expert_size = self.config.num_experts // num_expert_parallelism
           reshaped_group_sizes = jnp.sum(group_sizes.reshape(-1, local_expert_size), axis=1)
@@ -1717,12 +1521,6 @@ class RoutedMoE(nnx.Module):
             te_all_shards_tokens_per_expert = jax.lax.all_gather(
                 group_sizes[None, :], axis_name=expert_axis_name, axis=0, tiled=True
             )
-            # Dump te_all_shards_tokens_per_expert here (before the perm mode branch)
-            if TE_INSPECT_AVAILABLE and MOE_DEBUG_DUMP_TENSOR == "te_all_shards_tokens_per_expert":
-              te_all_shards_tokens_per_expert = te_inspect_array(
-                  te_all_shards_tokens_per_expert, "te_all_shards_tokens_per_expert"
-              )
-            
             if use_te_global_perm:
               # TE version: use tokens_per_expert directly
               input_offsets, send_sizes, output_offsets, recv_sizes = (
@@ -1732,37 +1530,12 @@ class RoutedMoE(nnx.Module):
                       num_expert_parallelism,
                   )
               )
-              # Debug logging for TE ragged_all_to_all params
-              _debug_log_sizes("TE_send_sizes", send_sizes, expert_shard_id)
-              _debug_log_sizes("TE_recv_sizes", recv_sizes, expert_shard_id)
-              _debug_log_sizes("TE_input_offsets", input_offsets, expert_shard_id)
-              _debug_log_sizes("TE_output_offsets", output_offsets, expert_shard_id)
-              # DEBUG: Dump ragged_all_to_all params using te_inspect_array (safe for multi-GPU)
-              # Set MOE_DEBUG_DUMP_TENSOR = "te_ragged_params" to enable
-              # NOTE: te_inspect_array ignores the name param and uses "my_tensor_gpuX.bin"
-              # So dump only ONE at a time to avoid overwrites:
-              #   - "te_send_sizes", "te_recv_sizes", "te_input_offsets", 
-              #   - "te_output_offsets", "te_all_shards_tokens_per_expert"
-              if TE_INSPECT_AVAILABLE and MOE_DEBUG_DUMP_TENSOR == "te_send_sizes":
-                send_sizes = te_inspect_array(send_sizes, "te_send_sizes")
-              if TE_INSPECT_AVAILABLE and MOE_DEBUG_DUMP_TENSOR == "te_recv_sizes":
-                recv_sizes = te_inspect_array(recv_sizes, "te_recv_sizes")
-              if TE_INSPECT_AVAILABLE and MOE_DEBUG_DUMP_TENSOR == "te_input_offsets":
-                input_offsets = te_inspect_array(input_offsets, "te_input_offsets")
-              if TE_INSPECT_AVAILABLE and MOE_DEBUG_DUMP_TENSOR == "te_output_offsets":
-                output_offsets = te_inspect_array(output_offsets, "te_output_offsets")
-              # te_all_shards_tokens_per_expert is now dumped before this block (line ~1671)
             else:
               input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
                   all_shards_group_sizes,
                   expert_shard_id,
                   num_expert_parallelism,
               )
-              # Debug logging for MT ragged_all_to_all params
-              _debug_log_sizes("MT_send_sizes", send_sizes, expert_shard_id)
-              _debug_log_sizes("MT_recv_sizes", recv_sizes, expert_shard_id)
-              _debug_log_sizes("MT_input_offsets", input_offsets, expert_shard_id)
-              _debug_log_sizes("MT_output_offsets", output_offsets, expert_shard_id)
 
             # TODO(ranran): For better performance, we could update output buffer to a smaller
             # size to replace self.get_expert_parallelism_size() for efficiency,
@@ -1799,10 +1572,6 @@ class RoutedMoE(nnx.Module):
                 recv_sizes,
                 axis_name=self._expert_parallelism_name,
             )
-            # Debug logging after ragged_all_to_all (forward)
-            _debug_log_array("after_ragged_all_to_all_fwd_x", x, expert_shard_id)
-            # Dump tensor to file if requested (for multi-GPU debugging)
-            x = _debug_dump_array("after_ragged_all_to_all_fwd_x", x)
 
             # =================================================================
             # Local Permutation: Either TE-based or standard implementation
@@ -1824,13 +1593,6 @@ class RoutedMoE(nnx.Module):
                   num_expert_parallelism,
               )
               local_sorted_indices = None  # Not used in TE path
-              # Debug logging after te_local_permute
-              _debug_log_array("after_te_local_permute_x", x, expert_shard_id)
-              _debug_log_sizes("after_te_local_permute_group_sizes", group_sizes, expert_shard_id)
-              # Dump tensor to file if requested (for multi-GPU debugging)
-              x = _debug_dump_array("after_te_local_permute_x", x)
-              # Gradient hook for backward pass debugging
-              x = _debug_grad_hook("after_te_local_permute_x", expert_shard_id)(x)
             else:
               # For MT local permute, we need UNPADDED group sizes
               # In mixed mode (TE global + MT local), use te_original_group_sizes
@@ -1852,13 +1614,6 @@ class RoutedMoE(nnx.Module):
                   shard_index=expert_shard_id,
                   use_custom_sort_vjp=self.config.use_custom_sort_vjp,
               )
-              # Debug logging after mt_local_permute
-              _debug_log_array("after_mt_local_permute_x", x, expert_shard_id)
-              _debug_log_sizes("after_mt_local_permute_group_sizes", group_sizes, expert_shard_id)
-              # Dump tensor to file if requested (for multi-GPU debugging)
-              x = _debug_dump_array("after_mt_local_permute_x", x)
-              # Gradient hook for backward pass debugging
-              x = _debug_grad_hook("after_mt_local_permute_x", expert_shard_id)(x)
 
           else:
             # Batch not sharded by expert
@@ -2000,12 +1755,6 @@ class RoutedMoE(nnx.Module):
       if self.config.mlp_bias:
         intermediate_output = intermediate_output + wo_bias
       intermediate_output = adc.checkpoint_name(intermediate_output, "moe_mlpwo")
-      # Debug logging after GMM
-      _debug_log_array("after_gmm_intermediate_output", intermediate_output, expert_shard_id)
-      # Dump tensor to file if requested (for multi-GPU debugging)
-      intermediate_output = _debug_dump_array("after_gmm_intermediate_output", intermediate_output)
-      # Gradient hook for backward pass debugging
-      intermediate_output = _debug_grad_hook("after_gmm_intermediate_output", expert_shard_id)(intermediate_output)
 
       if self.config.use_ring_of_experts:
         # Set the outputs of tokens which were not processed to 0.
@@ -2064,10 +1813,6 @@ class RoutedMoE(nnx.Module):
                   te_sorted_split_sizes,
                   te_inverse_chunk_indices,
               )
-              # Debug logging after te_local_unpermute
-              _debug_log_array("after_te_local_unpermute", intermediate_output, expert_shard_id)
-              # Dump tensor to file if requested (for multi-GPU debugging)
-              intermediate_output = _debug_dump_array("after_te_local_unpermute", intermediate_output)
             else:
               # Standard MaxText local unpermute
               if sorted_selected_experts.shape[0] != original_inputs_first_dim:
@@ -2077,10 +1822,6 @@ class RoutedMoE(nnx.Module):
                   jnp.argsort(local_sorted_indices),  # pylint: disable=undefined-variable
                   self.config.use_custom_sort_vjp,
               )
-              # Debug logging after MT local unpermute
-              _debug_log_array("after_mt_local_unpermute", intermediate_output, expert_shard_id)
-              # Dump tensor to file if requested (for multi-GPU debugging)
-              intermediate_output = _debug_dump_array("after_mt_local_unpermute", intermediate_output)
 
             # =================================================================
             # Step 2: Compute reverse ragged all-to-all params (follows global mode)
@@ -2139,12 +1880,6 @@ class RoutedMoE(nnx.Module):
                   slice_sizes=(1, num_expert_parallelism),
               ).squeeze(0)
 
-              # Debug logging for TE reverse ragged_all_to_all params
-              _debug_log_sizes("TE_reverse_send_sizes", recv_sizes_reverse, expert_shard_id)
-              _debug_log_sizes("TE_reverse_recv_sizes", send_sizes_reverse, expert_shard_id)
-              _debug_log_sizes("TE_reverse_input_offsets", input_offsets_reverse, expert_shard_id)
-              _debug_log_sizes("TE_reverse_output_offsets", output_offsets_reverse, expert_shard_id)
-
               intermediate_output = jax.lax.ragged_all_to_all(
                   intermediate_output,
                   output_shape,
@@ -2154,9 +1889,6 @@ class RoutedMoE(nnx.Module):
                   send_sizes_reverse,
                   axis_name=expert_axis_name,
               )
-              _debug_log_array("after_te_ragged_all_to_all_rev", intermediate_output, expert_shard_id)
-              # Dump tensor to file if requested (for multi-GPU debugging)
-              intermediate_output = _debug_dump_array("after_te_ragged_all_to_all_rev", intermediate_output)
             else:
               # MT version: use get_all_to_all_params with transposed group sizes
               input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
@@ -2164,11 +1896,6 @@ class RoutedMoE(nnx.Module):
                   expert_shard_id,
                   num_expert_parallelism,
               )
-              # Debug logging for MT reverse ragged_all_to_all params
-              _debug_log_sizes("MT_reverse_send_sizes", send_sizes, expert_shard_id)
-              _debug_log_sizes("MT_reverse_recv_sizes", recv_sizes, expert_shard_id)
-              _debug_log_sizes("MT_reverse_input_offsets", input_offsets, expert_shard_id)
-              _debug_log_sizes("MT_reverse_output_offsets", output_offsets, expert_shard_id)
 
               intermediate_output = jax.lax.ragged_all_to_all(
                   intermediate_output,
@@ -2179,9 +1906,6 @@ class RoutedMoE(nnx.Module):
                   recv_sizes,
                   axis_name=expert_axis_name,
               )
-              _debug_log_array("after_mt_ragged_all_to_all_rev", intermediate_output, expert_shard_id)
-              # Dump tensor to file if requested (for multi-GPU debugging)
-              intermediate_output = _debug_dump_array("after_mt_ragged_all_to_all_rev", intermediate_output)
           else:
             # Batch not sharded by expert - all shards have same batch, each processes local experts
             # In unpermute: first reverse local sort, then all-to-all to redistribute
@@ -2212,6 +1936,14 @@ class RoutedMoE(nnx.Module):
 
         # Global unpermute: TE token_combine or standard unpermute
         if use_te_global_perm:
+          # When using TE with padding, the output buffer from GMM may be larger
+          # than sum(group_sizes). Positions beyond actual tokens contain garbage
+          # that can produce NaN in token_combine. Zero them out.
+          if self.config.te_permutation_align_size > 0:
+            actual_tokens = jnp.sum(group_sizes)
+            mask = jnp.arange(intermediate_output.shape[0]) < actual_tokens
+            intermediate_output = jnp.where(mask[:, None], intermediate_output, 0)
+
           output = self.te_unpermute(
               intermediate_output,
               te_row_id_map,
@@ -2220,12 +1952,6 @@ class RoutedMoE(nnx.Module):
               dense_probs=te_dense_probs,
               pad_offsets=te_pad_offsets,
           )
-          # Debug logging after te_unpermute
-          _debug_log_array("after_te_unpermute_output", output, expert_shard_id)
-          # Dump tensor to file if requested (for multi-GPU debugging)
-          output = _debug_dump_array("after_te_unpermute_output", output)
-          # Gradient hook for backward pass debugging
-          output = _debug_grad_hook("after_te_unpermute_output", expert_shard_id)(output)
         else:
           output = self.unpermute(
               intermediate_output,
@@ -2235,12 +1961,6 @@ class RoutedMoE(nnx.Module):
               sequence_length=sequence_length,
               use_custom_sort_vjp=self.config.use_custom_sort_vjp,
           )
-          # Debug logging after mt_unpermute
-          _debug_log_array("after_mt_unpermute_output", output, expert_shard_id)
-          # Dump tensor to file if requested (for multi-GPU debugging)
-          output = _debug_dump_array("after_mt_unpermute_output", output)
-          # Gradient hook for backward pass debugging
-          output = _debug_grad_hook("after_mt_unpermute_output", expert_shard_id)(output)
 
       return output, lb_loss, bias_updates
 
