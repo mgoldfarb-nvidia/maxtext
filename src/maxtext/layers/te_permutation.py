@@ -326,10 +326,29 @@ def compute_ragged_all_to_all_params(
   # For each source shard, sum tokens destined for our experts
   recv_sizes = jnp.sum(local_expert_columns, axis=1)
 
-  # output_offsets: where to place received tokens from each shard
-  output_offsets = jnp.concatenate([
-      jnp.array([0], dtype=recv_sizes.dtype),
-      jnp.cumsum(recv_sizes)[:-1]
-  ])
+  # output_offsets: SENDER-SIDE semantics for jax.lax.ragged_all_to_all.
+  # output_offsets[j] = where shard j should place THIS shard's data in shard j's buffer.
+  # This equals the cumulative sum of what shards 0..shard_id-1 sent to shard j.
+  #
+  # Build sends_to_target[i][j] = total tokens shard i sends to shard j
+  # by reshaping all_shards_tokens_per_expert from (EP, num_experts) to
+  # (EP, EP, local_expert_size) and summing over the local_expert dimension.
+  sends_to_target = jnp.sum(
+      all_shards_tokens_per_expert.reshape(
+          num_expert_shards, num_expert_shards, local_expert_size
+      ),
+      axis=2,
+  )  # shape: (num_expert_shards, num_expert_shards)
+
+  # Prepend a zero row and cumsum along axis 0.
+  # cumulated[i] = sum of sends_to_target[0..i-1] per target shard.
+  zero_row = jnp.zeros((1, num_expert_shards), dtype=sends_to_target.dtype)
+  array_with_zeros = jnp.concatenate([zero_row, sends_to_target], axis=0)
+  cumulated = jnp.cumsum(array_with_zeros, axis=0, dtype=sends_to_target.dtype)
+  output_offsets = jax.lax.dynamic_slice(
+      cumulated,
+      start_indices=(shard_id, 0),
+      slice_sizes=(1, num_expert_shards),
+  ).squeeze(0)
 
   return input_offsets, send_sizes, output_offsets, recv_sizes

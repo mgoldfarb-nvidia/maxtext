@@ -82,8 +82,8 @@ MOE_PERM_DEBUG = False  # WARNING: Only works on single GPU!
 # Note: Each call overwrites the same file, so only set ONE tensor name at a time.
 # Set MOE_DEBUG_DUMP_ONCE=True to only dump on the first call (avoids backward pass overwriting).
 # =============================================================================
-MOE_DEBUG_DUMP_TENSOR = None  # e.g., "after_te_permute_x" or None to disable
-MOE_DEBUG_DUMP_ONCE = True    # If True, only dump on first call (forward pass)
+MOE_DEBUG_DUMP_TENSOR = None
+MOE_DEBUG_DUMP_ONCE = False    # If True, only dump on first call (forward pass)
 
 # Try to import te_inspect_array for multi-GPU debugging
 try:
@@ -92,6 +92,9 @@ try:
 except ImportError:
   TE_INSPECT_AVAILABLE = False
   te_inspect_array = None
+
+# DEBUG: Print import status and dump settings at module load time (comment out after debugging)
+print(f"[MOE DEBUG] TE_INSPECT_AVAILABLE = {TE_INSPECT_AVAILABLE}, MOE_DEBUG_DUMP_TENSOR = {MOE_DEBUG_DUMP_TENSOR}")
 
 # =============================================================================
 # Isolation Testing Knobs for MoE Permutation
@@ -119,8 +122,8 @@ except ImportError:
 #   - MOE_DEBUG_GLOBAL_PERM_MODE = "mt", MOE_DEBUG_LOCAL_PERM_MODE = "te":
 #       Test if local TE permute is the issue vs global MT permute
 # =============================================================================
-MOE_DEBUG_GLOBAL_PERM_MODE = None  # None, "te", or "mt"
-MOE_DEBUG_LOCAL_PERM_MODE = None   # None, "te", or "mt"
+MOE_DEBUG_GLOBAL_PERM_MODE = "te"
+MOE_DEBUG_LOCAL_PERM_MODE = "te"
 
 
 def _get_effective_perm_mode(config_use_te: bool, debug_mode: str | None) -> bool:
@@ -193,6 +196,9 @@ def _debug_dump_array(name: str, arr: jnp.ndarray) -> jnp.ndarray:
   # Mark as called
   _debug_dump_already_called.add(name)
   
+  # DEBUG: Print that we're about to dump (this runs at trace time, not runtime)
+  print(f"[MOE_DEBUG] Calling te_inspect_array for '{name}', shape={arr.shape}, dtype={arr.dtype}")
+
   # Use te_inspect_array to dump the tensor to file
   # Must re-assign to prevent XLA from optimizing out the call
   return te_inspect_array(arr, name)
@@ -1693,6 +1699,8 @@ class RoutedMoE(nnx.Module):
 
         if num_expert_parallelism > 1:
           batch_axis = self._expert_parallelism_name if is_batch_sharded_by_expert else "data"
+          # DEBUG: Print condition values (comment out after debugging)
+          print(f"[MOE DEBUG RUNTIME] num_expert_parallelism={num_expert_parallelism}, is_batch_sharded_by_expert={is_batch_sharded_by_expert}, use_te_global_perm={use_te_global_perm}")
           # get group sizes for all shards
           local_expert_size = self.config.num_experts // num_expert_parallelism
           reshaped_group_sizes = jnp.sum(group_sizes.reshape(-1, local_expert_size), axis=1)
@@ -1709,6 +1717,11 @@ class RoutedMoE(nnx.Module):
             te_all_shards_tokens_per_expert = jax.lax.all_gather(
                 group_sizes[None, :], axis_name=expert_axis_name, axis=0, tiled=True
             )
+            # Dump te_all_shards_tokens_per_expert here (before the perm mode branch)
+            if TE_INSPECT_AVAILABLE and MOE_DEBUG_DUMP_TENSOR == "te_all_shards_tokens_per_expert":
+              te_all_shards_tokens_per_expert = te_inspect_array(
+                  te_all_shards_tokens_per_expert, "te_all_shards_tokens_per_expert"
+              )
             
             if use_te_global_perm:
               # TE version: use tokens_per_expert directly
@@ -1726,14 +1739,19 @@ class RoutedMoE(nnx.Module):
               _debug_log_sizes("TE_output_offsets", output_offsets, expert_shard_id)
               # DEBUG: Dump ragged_all_to_all params using te_inspect_array (safe for multi-GPU)
               # Set MOE_DEBUG_DUMP_TENSOR = "te_ragged_params" to enable
-              if TE_INSPECT_AVAILABLE and MOE_DEBUG_DUMP_TENSOR == "te_ragged_params":
+              # NOTE: te_inspect_array ignores the name param and uses "my_tensor_gpuX.bin"
+              # So dump only ONE at a time to avoid overwrites:
+              #   - "te_send_sizes", "te_recv_sizes", "te_input_offsets", 
+              #   - "te_output_offsets", "te_all_shards_tokens_per_expert"
+              if TE_INSPECT_AVAILABLE and MOE_DEBUG_DUMP_TENSOR == "te_send_sizes":
                 send_sizes = te_inspect_array(send_sizes, "te_send_sizes")
+              if TE_INSPECT_AVAILABLE and MOE_DEBUG_DUMP_TENSOR == "te_recv_sizes":
                 recv_sizes = te_inspect_array(recv_sizes, "te_recv_sizes")
+              if TE_INSPECT_AVAILABLE and MOE_DEBUG_DUMP_TENSOR == "te_input_offsets":
                 input_offsets = te_inspect_array(input_offsets, "te_input_offsets")
+              if TE_INSPECT_AVAILABLE and MOE_DEBUG_DUMP_TENSOR == "te_output_offsets":
                 output_offsets = te_inspect_array(output_offsets, "te_output_offsets")
-                te_all_shards_tokens_per_expert = te_inspect_array(
-                    te_all_shards_tokens_per_expert, "te_all_shards_tokens_per_expert"
-                )
+              # te_all_shards_tokens_per_expert is now dumped before this block (line ~1671)
             else:
               input_offsets, send_sizes, output_offsets, recv_sizes = RoutedMoE.get_all_to_all_params(
                   all_shards_group_sizes,
@@ -2095,10 +2113,31 @@ class RoutedMoE(nnx.Module):
               ).squeeze(0)
               local_reshaped = local_tokens_per_expert.reshape(num_expert_parallelism, local_expert_size)
               send_sizes_reverse = jnp.sum(local_reshaped, axis=1)
-              output_offsets_reverse = jnp.concatenate([
-                  jnp.array([0], dtype=send_sizes_reverse.dtype),
-                  jnp.cumsum(send_sizes_reverse)[:-1],
-              ])
+
+              # output_offsets_reverse: SENDER-SIDE semantics for jax.lax.ragged_all_to_all.
+              # In reverse, the "sends_to_target" matrix is the TRANSPOSE of the forward one:
+              # reverse_sends_to[i][j] = forward recv by shard i from shard j
+              #                        = forward sends_to[j][i]
+              # Build forward sends_to from te_all_shards_tokens_per_expert, then transpose.
+              fwd_sends_to = jnp.sum(
+                  te_all_shards_tokens_per_expert.reshape(
+                      num_expert_parallelism, num_expert_parallelism, local_expert_size
+                  ),
+                  axis=2,
+              )  # (EP, EP): fwd_sends_to[i][j] = shard i sends to shard j
+              rev_sends_to = jnp.transpose(fwd_sends_to)  # (EP, EP): rev_sends_to[i][j] = fwd_sends_to[j][i]
+
+              zero_row = jnp.zeros((1, num_expert_parallelism), dtype=rev_sends_to.dtype)
+              rev_cumulated = jnp.cumsum(
+                  jnp.concatenate([zero_row, rev_sends_to], axis=0),
+                  axis=0,
+                  dtype=rev_sends_to.dtype,
+              )
+              output_offsets_reverse = jax.lax.dynamic_slice(
+                  rev_cumulated,
+                  start_indices=(expert_shard_id, 0),
+                  slice_sizes=(1, num_expert_parallelism),
+              ).squeeze(0)
 
               # Debug logging for TE reverse ragged_all_to_all params
               _debug_log_sizes("TE_reverse_send_sizes", recv_sizes_reverse, expert_shard_id)
@@ -3037,3 +3076,4 @@ def get_routed_and_shared_moe(
       abstract_init=False,
   )
   return module
+
