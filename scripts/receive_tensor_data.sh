@@ -45,13 +45,14 @@ done
 # Find the archive file if not specified
 if [ -z "$ARCHIVE_FILE" ]; then
     echo "No archive file specified, looking for most recent in ${DATA_DIR}..."
-    ARCHIVE_FILE=$(ls -t "${DATA_DIR}"/tensor_dump_*.tar.gz 2>/dev/null | head -1)
+    # Look for any .tar.gz file (supports both tensor_dump_* and mode_tensor_* patterns)
+    ARCHIVE_FILE=$(ls -t "${DATA_DIR}"/*.tar.gz 2>/dev/null | head -1)
     
     if [ -z "$ARCHIVE_FILE" ]; then
-        echo "ERROR: No tensor_dump_*.tar.gz files found in ${DATA_DIR}"
+        echo "ERROR: No .tar.gz files found in ${DATA_DIR}"
         echo ""
-        echo "Available files:"
-        ls -la "${DATA_DIR}"/*.tar.gz 2>/dev/null || echo "  (none)"
+        echo "Available files in ${DATA_DIR}:"
+        ls -la "${DATA_DIR}"/ 2>/dev/null || echo "  (directory not found)"
         exit 1
     fi
 fi

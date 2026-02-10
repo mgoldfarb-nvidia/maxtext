@@ -29,6 +29,12 @@ EP=2
 FSDP=2
 STEPS=1  # Only need 1 step for tensor dumps
 
+# Global variable to store the last test output directory
+LAST_OUTPUT_DIR=""
+
+# Scenarios actually run in this invocation (used so we only archive those)
+RUN_SCENARIOS=()
+
 # Parse arguments
 DRY_RUN=false
 ONLY_SCENARIO=""
@@ -166,10 +172,16 @@ MAXTEXT_DIR=${MAXTEXT_DIR} test-maxtext.sh -b 2 --model-name=mixtral-8x7b --attn
 EOF
     chmod +x "$TMP_SCRIPT"
     
-    # Run the test
+    # Run the test and capture output
     cd "$MAXTEXT_DIR"
     bash "$TMP_SCRIPT" 2>&1 | tee "${OUTPUT_BASE_DIR}/run_log.txt"
     local exit_code=${PIPESTATUS[0]}
+    
+    # Extract the output directory from the log (e.g., "Output at /tmp/tmp.xxx")
+    LAST_OUTPUT_DIR=$(grep -o "Output at /tmp/tmp\.[^[:space:]]*" "${OUTPUT_BASE_DIR}/run_log.txt" | tail -1 | sed 's/Output at //')
+    if [ -n "$LAST_OUTPUT_DIR" ]; then
+        echo "  Test output directory: ${LAST_OUTPUT_DIR}"
+    fi
     
     rm -f "$TMP_SCRIPT"
     return $exit_code
@@ -190,13 +202,60 @@ collect_tensors() {
     
     mkdir -p "$target_dir"
     
-    # Move tensor files (they're created in the current working directory)
+    # Search for tensor files in multiple locations
+    # 1. Current directory
+    # 2. MAXTEXT_DIR
+    # 3. Recently modified files anywhere under MAXTEXT_DIR
+    # 4. /tmp directories (test output dirs)
+    
+    local found=false
+    
+    # First, try MAXTEXT_DIR
     cd "$MAXTEXT_DIR"
     if ls my_tensor_gpu*.bin 1>/dev/null 2>&1; then
         mv my_tensor_gpu*.bin "$target_dir/"
-        echo "  Moved $(ls ${target_dir}/my_tensor_gpu*.bin | wc -l) tensor files"
+        found=true
+        echo "  Moved files from ${MAXTEXT_DIR}"
+    fi
+    
+    # If not found, search in recent /tmp directories
+    if [ "$found" = false ]; then
+        # Find tensor files modified in the last 5 minutes
+        local tensor_files=$(find /tmp -name "my_tensor_gpu*.bin" -mmin -5 2>/dev/null)
+        if [ -n "$tensor_files" ]; then
+            for f in $tensor_files; do
+                mv "$f" "$target_dir/" 2>/dev/null && echo "  Moved: $f"
+            done
+            found=true
+        fi
+    fi
+    
+    # Check the captured test output directory
+    if [ "$found" = false ] && [ -n "$LAST_OUTPUT_DIR" ] && [ -d "$LAST_OUTPUT_DIR" ]; then
+        if ls "${LAST_OUTPUT_DIR}"/my_tensor_gpu*.bin 1>/dev/null 2>&1; then
+            mv "${LAST_OUTPUT_DIR}"/my_tensor_gpu*.bin "$target_dir/"
+            echo "  Moved files from test output dir: ${LAST_OUTPUT_DIR}"
+            found=true
+        fi
+    fi
+    
+    # Also check the home directory and common locations
+    if [ "$found" = false ]; then
+        for search_dir in "$HOME" "/root" "$(pwd)"; do
+            if ls "${search_dir}"/my_tensor_gpu*.bin 1>/dev/null 2>&1; then
+                mv "${search_dir}"/my_tensor_gpu*.bin "$target_dir/"
+                echo "  Moved files from ${search_dir}"
+                found=true
+                break
+            fi
+        done
+    fi
+    
+    # Verify files were collected
+    if ls "${target_dir}"/my_tensor_gpu*.bin 1>/dev/null 2>&1; then
+        echo "  Collected $(ls ${target_dir}/my_tensor_gpu*.bin | wc -l) tensor files"
     else
-        echo "  WARNING: No tensor files found!"
+        echo "  WARNING: No tensor files found in any location!"
     fi
 }
 
@@ -233,6 +292,7 @@ for scenario in "${SCENARIOS[@]}"; do
         continue
     fi
     
+    RUN_SCENARIOS+=("$scenario_name")
     echo ""
     echo "====== Scenario: ${scenario_name} ======"
     echo "  use_te_permutation=${use_te_perm}"
@@ -275,12 +335,16 @@ done
 # Reset moe.py
 reset_moe_py
 
-# Create archive
+# Create archive (only for scenarios we ran in this invocation)
 echo ""
 echo "====== Creating Archive ======"
 if [ "$DRY_RUN" = false ]; then
     cd "$OUTPUT_BASE_DIR"
-    tar -czvf "${ARCHIVE_NAME}" */
+    if [ ${#RUN_SCENARIOS[@]} -gt 0 ]; then
+        tar -czvf "${ARCHIVE_NAME}" "${RUN_SCENARIOS[@]/%//}"
+    else
+        tar -czvf "${ARCHIVE_NAME}" */
+    fi
     echo "Created archive: ${OUTPUT_BASE_DIR}/${ARCHIVE_NAME}"
     
     # Send to local machine
@@ -297,3 +361,4 @@ echo ""
 echo "=============================================="
 echo "Tensor dump complete!"
 echo "=============================================="
+
