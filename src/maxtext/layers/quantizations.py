@@ -952,8 +952,37 @@ class TransformerEngineQuantization(Quantization):
   def gmm(self, inputs, kernel, tiling, group_sizes, expert_assignments):
     """ Grouped GEMM """
     import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
-    return te_flax.make_ragged_dot_cls(quantization_recipe=self._recipe)(
+    out = te_flax.make_ragged_dot_cls(quantization_recipe=self._recipe)(
         inputs,
         kernel,
         group_sizes,
     )
+
+    def jax_ragged_dot(x, kernel, group_sizes, tiling):
+        import random
+        from jax.experimental import xla_metadata
+
+        is_tpu = False
+        # TPU needs random mosaic_fusion_group; GPU/CPU needs deterministic ID for autotuner sync
+        mosaic_group_id = f"{random.randint(0, 1000000000)}" if is_tpu else "0"
+        with xla_metadata.set_xla_metadata(
+            ragged_dot_tiling=",".join([str(t) for t in tiling]),
+            mosaic_fusion_group=mosaic_group_id,
+        ):
+            output = jax.lax.ragged_dot(
+                lhs=x,
+                rhs=kernel,
+                group_sizes=group_sizes,
+                preferred_element_type=x.dtype,
+            )
+        return output
+    
+    out_jax = jax_ragged_dot(inputs, kernel, group_sizes, tiling)
+    assert out.shape == out_jax.shape, f"Output shape mismatch between TE GMM and JAX ragged_dot: {out.shape} vs {out_jax.shape}"
+
+    jax_out = jax_ragged_dot(inputs, kernel, group_sizes, tiling)
+
+    from transformer_engine.jax.debug.experimental import compare
+    out = compare(out, jax_out, "te_grouped_dot_general")
+
+    return out

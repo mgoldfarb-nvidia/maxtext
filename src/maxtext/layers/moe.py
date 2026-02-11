@@ -1292,8 +1292,8 @@ class RoutedMoE(nnx.Module):
             # Use full contraction for QWIX quantization to allow quantization
             # fusion (max reduce over contracting dimension).
             tiling = (tiling[0], k, tiling[2])
-          if use_te_gmm and False:
-            return self.quant.gmm(inputs, kernel, tiling, group_sizes, expert_assignments)
+          if use_te_gmm:
+            return self.quant.gmm(inputs, rhs_inputs, tiling, group_sizes, expert_assignments)
           else:
             is_tpu = self.mesh.devices.flat[0] == "tpu"
             # TPU needs random mosaic_fusion_group; GPU/CPU needs deterministic ID for autotuner sync
