@@ -708,6 +708,7 @@ class RoutedMoE(nnx.Module):
       gate_logits: jax.Array,
       pre_bias_logits: Optional[jax.Array],
       rngs=None,
+      roll_to_expert_id=None,
   ) -> Tuple[
       jax.Array,
       jax.Array,
@@ -774,6 +775,11 @@ class RoutedMoE(nnx.Module):
       )
     else:
       bias_updates = None
+
+    # For ring-of-experts: shift expert indices so each shard's local experts
+    # become 0..local_expert_size-1 (same as MT's roll logic)
+    if roll_to_expert_id is not None:
+      top_k_indices = (top_k_indices - roll_to_expert_id) % self.num_experts
 
     # Convert indices to routing map (binary mask)
     routing_map = te_permutation.create_routing_map_from_indices(
@@ -926,22 +932,20 @@ class RoutedMoE(nnx.Module):
     use_te = getattr(self.config, "use_te_permutation", False) and te_permutation.TE_PERMUTATION_AVAILABLE
     perm_state = PermState(use_te)
 
-    if use_te and roll_to_expert_id is None:
-      # TE permutation path (not compatible with roll_to_expert_id used by ring_of_experts)
+    if use_te:
+      # TE permutation path
       (
           x, perm_state.row_id_map, weights, group_sizes, top_k_indices,
           lb_loss, bias_updates, perm_state.dense_probs, perm_state.pad_offsets,
-      ) = self._te_permute(inputs, gate_logits, pre_bias_logits, rngs)
+      ) = self._te_permute(inputs, gate_logits, pre_bias_logits, rngs, roll_to_expert_id)
       # Create selected_experts for bias transform and GMM
       expert_indices = jnp.arange(self.num_experts)
       selected_experts = jnp.repeat(
           expert_indices, repeats=group_sizes, total_repeat_length=x.shape[0],
       )
-      # Store weights in perm_state (not used by TE unpermute, but kept for consistency)
       perm_state.weights = weights
     else:
-      # MT permutation path (also used when roll_to_expert_id is set, e.g. ring_of_experts)
-      perm_state.use_te = False
+      # MT permutation path
       x, perm_state.sorted_selected_experts, perm_state.weights, group_sizes, selected_experts, lb_loss, bias_updates = (
           self._mt_permute(inputs, gate_logits, pre_bias_logits, use_custom_sort_vjp, rngs, roll_to_expert_id)
       )
@@ -1817,9 +1821,10 @@ class RoutedMoE(nnx.Module):
         intermediate_output = jnp.where(mask[:, None], intermediate_output, 0)
 
         # Unsort and deduplicate the outputs locally.
-        # Ring path uses MT unpermute (ring always uses MT permute)
+        # Use all-gathered batch size (batch_size * EP) since inputs were all-gathered.
+        gathered_batch_size = batch_size * num_expert_parallelism
         output = self.unpermute(
-            intermediate_output, perm_state, group_sizes, batch_size, sequence_length,
+            intermediate_output, perm_state, group_sizes, gathered_batch_size, sequence_length,
         )
 
         # Sum up the partial outputs across the expert shards.
