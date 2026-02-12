@@ -352,3 +352,76 @@ def compute_ragged_all_to_all_params(
   ).squeeze(0)
 
   return input_offsets, send_sizes, output_offsets, recv_sizes
+
+
+def compute_reverse_ragged_all_to_all_params(
+    all_shards_tokens_per_expert: jnp.ndarray,
+    shard_id: int,
+    num_expert_shards: int,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+  """Compute reverse ragged_all_to_all parameters (for unpermute).
+
+  In reverse, what we received in the forward pass becomes what we send,
+  and vice versa. The sends_to_target matrix is transposed.
+
+  Args:
+    all_shards_tokens_per_expert: Token counts from all shards.
+                                  Shape [num_expert_shards, num_experts].
+    shard_id: Current shard index.
+    num_expert_shards: Number of expert-parallel shards.
+
+  Returns:
+    input_offsets: Shape [num_expert_shards].
+    send_sizes: Shape [num_expert_shards].
+    output_offsets: Shape [num_expert_shards].
+    recv_sizes: Shape [num_expert_shards].
+  """
+  num_experts = all_shards_tokens_per_expert.shape[1]
+  local_expert_size = num_experts // num_expert_shards
+  local_expert_start = shard_id * local_expert_size
+
+  # In reverse: what we received becomes what we send.
+  # We received tokens for our local experts from each source shard.
+  local_expert_columns = jax.lax.dynamic_slice(
+      all_shards_tokens_per_expert,
+      start_indices=(0, local_expert_start),
+      slice_sizes=(num_expert_shards, local_expert_size)
+  )
+  send_sizes = jnp.sum(local_expert_columns, axis=1)
+  input_offsets = jnp.concatenate([
+      jnp.array([0], dtype=send_sizes.dtype),
+      jnp.cumsum(send_sizes)[:-1],
+  ])
+
+  # What we originally sent (now we receive back).
+  local_tokens_per_expert = jax.lax.dynamic_slice(
+      all_shards_tokens_per_expert,
+      start_indices=(shard_id, 0),
+      slice_sizes=(1, num_experts)
+  ).squeeze(0)
+  local_reshaped = local_tokens_per_expert.reshape(num_expert_shards, local_expert_size)
+  recv_sizes = jnp.sum(local_reshaped, axis=1)
+
+  # output_offsets: SENDER-SIDE semantics.
+  # In reverse, sends_to_target is the transpose of the forward one.
+  fwd_sends_to = jnp.sum(
+      all_shards_tokens_per_expert.reshape(
+          num_expert_shards, num_expert_shards, local_expert_size
+      ),
+      axis=2,
+  )
+  rev_sends_to = jnp.transpose(fwd_sends_to)
+
+  zero_row = jnp.zeros((1, num_expert_shards), dtype=rev_sends_to.dtype)
+  rev_cumulated = jnp.cumsum(
+      jnp.concatenate([zero_row, rev_sends_to], axis=0),
+      axis=0,
+      dtype=rev_sends_to.dtype,
+  )
+  output_offsets = jax.lax.dynamic_slice(
+      rev_cumulated,
+      start_indices=(shard_id, 0),
+      slice_sizes=(1, num_expert_shards),
+  ).squeeze(0)
+
+  return input_offsets, send_sizes, output_offsets, recv_sizes
