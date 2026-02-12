@@ -927,7 +927,7 @@ class RoutedMoE(nnx.Module):
     perm_state = PermState(use_te)
 
     if use_te and roll_to_expert_id is None:
-      # TE permutation path
+      # TE permutation path (not compatible with roll_to_expert_id used by ring_of_experts)
       (
           x, perm_state.row_id_map, weights, group_sizes, top_k_indices,
           lb_loss, bias_updates, perm_state.dense_probs, perm_state.pad_offsets,
@@ -940,7 +940,8 @@ class RoutedMoE(nnx.Module):
       # Store weights in perm_state (not used by TE unpermute, but kept for consistency)
       perm_state.weights = weights
     else:
-      # MT permutation path
+      # MT permutation path (also used when roll_to_expert_id is set, e.g. ring_of_experts)
+      perm_state.use_te = False
       x, perm_state.sorted_selected_experts, perm_state.weights, group_sizes, selected_experts, lb_loss, bias_updates = (
           self._mt_permute(inputs, gate_logits, pre_bias_logits, use_custom_sort_vjp, rngs, roll_to_expert_id)
       )
