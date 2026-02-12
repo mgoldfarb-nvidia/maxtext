@@ -952,16 +952,17 @@ class TransformerEngineQuantization(Quantization):
   def gmm(self, inputs, kernel, tiling, group_sizes, expert_assignments):
     """ Grouped GEMM """
     import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
-    DEBUG = False
+    DEBUG = True
 
-    out = te_flax.make_ragged_dot_cls(quantization_recipe=self._recipe)(
-        inputs,
-        kernel,
-        group_sizes,
-    )
+    def te_func(x, w, group_sizes, tiling):
+      return te_flax.make_ragged_dot_cls(quantization_recipe=self._recipe)(
+          x,
+          w,
+          group_sizes,
+      )
 
     if not DEBUG:
-      return out
+      return te_func(inputs, kernel, group_sizes, tiling)
 
     def jax_ragged_dot(x, kernel, group_sizes, tiling):
         import random
@@ -981,13 +982,6 @@ class TransformerEngineQuantization(Quantization):
                 preferred_element_type=x.dtype,
             )
         return output
-    
-    out_jax = jax_ragged_dot(inputs, kernel, group_sizes, tiling)
-    assert out.shape == out_jax.shape, f"Output shape mismatch between TE GMM and JAX ragged_dot: {out.shape} vs {out_jax.shape}"
 
-    jax_out = jax_ragged_dot(inputs, kernel, group_sizes, tiling)
-
-    from transformer_engine.jax.debug.experimental import compare
-    out = compare(out, jax_out, "te_grouped_dot_general")
-
-    return out
+    from transformer_engine.jax.debug.experimental import compare_vjp
+    return compare_vjp(te_func, jax_ragged_dot, "te_grouped_dot_general")(inputs, kernel, group_sizes, tiling)
