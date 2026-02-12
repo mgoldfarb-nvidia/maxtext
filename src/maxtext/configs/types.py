@@ -628,7 +628,7 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use Ring of Experts for sparse matmul expert parallelism.",
   )
-  use_te_permutation: bool = Field(
+  te_permutation_impl: bool = Field(
       False,
       description="Whether to use TransformerEngine permutation kernels for MoE token dispatch/combine.",
   )

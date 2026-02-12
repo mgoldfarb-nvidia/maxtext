@@ -194,13 +194,6 @@ def te_token_dispatch(
       align_size=align_size,
   )
 
-  # Defensive unpacking with validation
-  if len(result) != 5:
-    raise ValueError(
-        f"Expected 5 return values from TE token_dispatch, got {len(result)}. "
-        f"Types: {[type(r).__name__ for r in result]}"
-    )
-
   output, permuted_probs, row_id_map, pad_offsets, tokens_per_expert = result
 
   # Validate tokens_per_expert is not None (should always be returned by TE >= latest)
