@@ -952,10 +952,11 @@ class TransformerEngineQuantization(Quantization):
   def gmm(self, inputs, kernel, tiling, group_sizes, expert_assignments):
     """ Grouped GEMM """
     import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
-    DEBUG = True
+    DEBUG = False
 
     def te_func(x, w, group_sizes, tiling):
-      return te_flax.make_ragged_dot_cls(quantization_recipe=self._recipe)(
+      the_recipe = None # self._recipe
+      return te_flax.make_ragged_dot_cls(quantization_recipe=the_recipe)(
           x,
           w,
           group_sizes,
