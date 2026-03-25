@@ -1593,6 +1593,7 @@ class RoutedMoE(nnx.Module):
     )
     def wrapper(x, logits, pre_bias_logits, w0, w1, wo, w0_bias, w1_bias, wo_bias, rngs):
       batch_size, sequence_length, _ = x.shape
+      expert_axis_name = "expert"
       num_expert_parallelism = self.get_expert_parallelism_size()
       if num_expert_parallelism > 1:
         expert_shard_id = jax.lax.axis_index(self._expert_parallelism_name)
@@ -1633,7 +1634,7 @@ class RoutedMoE(nnx.Module):
         use_te_perm = perm_state.use_te
 
         if num_expert_parallelism > 1:
-          batch_axis = "expert" if is_batch_sharded_by_expert else "data"
+          batch_axis = self._expert_parallelism_name if is_batch_sharded_by_expert else "data"
           # get group sizes for all shards
           local_expert_size = self.config.num_experts // num_expert_parallelism
           reshaped_group_sizes = jnp.sum(group_sizes.reshape(-1, local_expert_size), axis=1)
