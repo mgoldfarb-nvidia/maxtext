@@ -518,10 +518,7 @@ def validate_and_assign_remat_tensors(keys):
       "mlpwi_0",
       "mlpwi_1",
       "mlpwo",
-<<<<<<< HEAD:src/maxtext/configs/pyconfig_deprecated.py
-=======
       "moe_mlpwi",
->>>>>>> 717ddf59 (Add MoE and MLA remat policies):src/MaxText/pyconfig_deprecated.py
       "moe_mlpwi_0",
       "moe_mlpwi_1",
       "moe_mlpwo",
