@@ -1401,7 +1401,7 @@ class RoutedMoE(nnx.Module):
       kernel = kernel.astype(self.dtype)
 
       lhs_quantize_dtype, rhs_quantize_dtype = None, None
-      if self.quant is not None and hasattr(self.quant, 'quant_dg') and not use_te_gmm:
+      if self.quant is not None and hasattr(self.quant, 'quant_dg'):
         quant_dg = self.quant.quant_dg
         lhs_quantize_dtype = quant_dg.fwd.dg_quantizer.lhs.numerics.get_dtype()
         rhs_quantize_dtype = quant_dg.fwd.dg_quantizer.rhs.numerics.get_dtype()
