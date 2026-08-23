@@ -287,7 +287,7 @@ def compute_ragged_all_to_all_params(
   # Use dynamic_slice since shard_id may be a traced value (from jax.lax.axis_index)
   local_tokens_per_expert = jax.lax.dynamic_slice(
       all_shards_tokens_per_expert,
-      start_indices=(shard_id, 0),
+      start_indices=(shard_id, jnp.zeros_like(shard_id)),
       slice_sizes=(1, num_experts)
   ).squeeze(0)
 
@@ -312,7 +312,7 @@ def compute_ragged_all_to_all_params(
   # Extract columns [local_expert_start : local_expert_start + local_expert_size]
   local_expert_columns = jax.lax.dynamic_slice(
       all_shards_tokens_per_expert,
-      start_indices=(0, local_expert_start),
+      start_indices=(jnp.zeros_like(local_expert_start), local_expert_start),
       slice_sizes=(all_shards_tokens_per_expert.shape[0], local_expert_size)
   )
 
@@ -340,7 +340,7 @@ def compute_ragged_all_to_all_params(
   cumulated = jnp.cumsum(array_with_zeros, axis=0, dtype=sends_to_target.dtype)
   output_offsets = jax.lax.dynamic_slice(
       cumulated,
-      start_indices=(shard_id, 0),
+      start_indices=(shard_id, jnp.zeros_like(shard_id)),
       slice_sizes=(1, num_expert_shards),
   ).squeeze(0)
 
@@ -377,7 +377,7 @@ def compute_reverse_ragged_all_to_all_params(
   # We received tokens for our local experts from each source shard.
   local_expert_columns = jax.lax.dynamic_slice(
       all_shards_tokens_per_expert,
-      start_indices=(0, local_expert_start),
+      start_indices=(jnp.zeros_like(local_expert_start), local_expert_start),
       slice_sizes=(num_expert_shards, local_expert_size)
   )
   send_sizes = jnp.sum(local_expert_columns, axis=1)
@@ -389,7 +389,7 @@ def compute_reverse_ragged_all_to_all_params(
   # What we originally sent (now we receive back).
   local_tokens_per_expert = jax.lax.dynamic_slice(
       all_shards_tokens_per_expert,
-      start_indices=(shard_id, 0),
+      start_indices=(shard_id, jnp.zeros_like(shard_id)),
       slice_sizes=(1, num_experts)
   ).squeeze(0)
   local_reshaped = local_tokens_per_expert.reshape(num_expert_shards, local_expert_size)
@@ -413,7 +413,7 @@ def compute_reverse_ragged_all_to_all_params(
   )
   output_offsets = jax.lax.dynamic_slice(
       rev_cumulated,
-      start_indices=(shard_id, 0),
+      start_indices=(shard_id, jnp.zeros_like(shard_id)),
       slice_sizes=(1, num_expert_shards),
   ).squeeze(0)
 

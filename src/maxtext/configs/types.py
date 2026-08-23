@@ -602,6 +602,11 @@ class MoEGeneral(BaseModel):
       False,
       description="Whether to use Ring of Experts for sparse matmul expert parallelism.",
   )
+  use_hybrid_ep: bool = Field(
+      False,
+      description="Whether to use DeepEP hybridEP for MoE dispatch/combine (NVLink domain only, GPU).",
+  )
+  hybrid_ep_pad_multiple: int = Field(32, description="Padding alignment for hybridEP expert GEMMs.")
   te_permutation_impl: bool = Field(
       False,
       description="Whether to use TransformerEngine permutation kernels for MoE token dispatch/combine.",

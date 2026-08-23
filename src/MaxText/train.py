@@ -406,6 +406,13 @@ def train_loop(config, recorder, state=None):
       state,
   ) = train_utils.setup_train_loop(config, recorder)
 
+  # Initialize HybridEP buffer manager if enabled
+  if config.use_hybrid_ep:
+    import jax_deep_ep
+    from jax_deep_ep.ffi_ops import set_buffer_manager as ffi_set_buffer_manager
+    mgr = jax_deep_ep.init(maxtext_config=config)
+    ffi_set_buffer_manager(mgr)
+
   if config.use_dpo:
     if "reference_params" not in state.params:
       reference_params = jax.tree.map(jnp.copy, state.params["params"])

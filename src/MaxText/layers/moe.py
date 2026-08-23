@@ -1586,7 +1586,29 @@ class RoutedMoE(nnx.Module):
         expert_shard_id = 0
       num_expert_parallelism = self.get_expert_parallelism_size()
 
-      if self.config.use_ring_of_experts:
+      if self.config.use_hybrid_ep:
+        # HybridEP path: DeepEP dispatch/combine replaces ring-of-experts
+        from jax_deep_ep.maxtext_integration import hybrid_ep_sparse_matmul
+        gmm_hybrid = functools.partial(
+            self._gmm,
+            lhs_quantize_dtype=self.config.moe_lhs_quantize_dtype,
+        )
+        output, lb_loss, bias_updates = hybrid_ep_sparse_matmul(
+            x=x,
+            logits=logits,
+            pre_bias_logits=pre_bias_logits,
+            w0=w0, w1=w1, wo=wo,
+            w0_bias=w0_bias, w1_bias=w1_bias, wo_bias=wo_bias,
+            config=self.config,
+            permute_fn=self.permute,
+            gmm_fn=gmm_hybrid,
+            apply_ffn_activation_fn=self.apply_ffn_activation,
+            expert_axis_name=expert_axis_name,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+        )
+        return output, lb_loss, bias_updates
+      elif self.config.use_ring_of_experts:
         # The ring-of-experts strategy first duplicates the inputs to all
         # expert shards, and then routes within each shard.
 
