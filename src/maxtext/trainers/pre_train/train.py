@@ -45,7 +45,7 @@ from maxtext.utils.globals import EPS
 
 # pylint: disable=too-many-positional-arguments
 from maxtext.layers.multi_token_prediction import calculate_mtp_acceptance_rate, calculate_mtp_loss
-from maxtext.common import checkpointing, profiler
+from maxtext.common import checkpointing, profiler, xsched_timing
 from maxtext.common.goodput import (
     GoodputEvent,
     RECORD_JOB_END_TIME,
@@ -492,6 +492,16 @@ def train_loop(config, recorder, state=None):
   start_step = get_first_step(state)  # this is the start_step for training
   prof = profiler.Profiler(config, offset_step=start_step)
   metric_logger = MetricLogger(config=config, learning_rate_schedule=learning_rate_schedule)
+  timing_spec = xsched_timing.SynchronizedWindowSpec.from_environment(os.environ)
+  timing_window = (
+      xsched_timing.SynchronizedWindowTimer(
+          timing_spec,
+          first_step=start_step,
+          final_step_exclusive=config.steps,
+      )
+      if timing_spec is not None
+      else None
+  )
 
   # Write train config params, num model params, and XLA flags to tensorboard
   metric_logger.write_setup_info_to_tensorboard(state.params)
@@ -555,6 +565,8 @@ def train_loop(config, recorder, state=None):
         max_utils.print_mem_stats("After params initialized")
 
       metric_logger.buffer_and_write_train_metrics(metrics, step, step_time_delta)
+      if timing_window is not None:
+        timing_window.after_step(step, state)
 
     if config.save_checkpoint_on_completion:
       state_to_save = state if not config.use_dpo else _split_dpo_state(state)[0]
@@ -565,9 +577,13 @@ def train_loop(config, recorder, state=None):
     _job_completed_gracefully = True
   except exceptions.StopTraining as e:
     max_logging.log(f"Training stopped: {str(e)}")
+    if timing_window is not None:
+      raise
     _job_completed_gracefully = True
   finally:
     if _job_completed_gracefully:
+      if timing_window is not None:
+        timing_window.require_complete()
       record_goodput(recorder, RECORD_JOB_END_TIME)
     metric_logger.flush_metrics_and_cleanup()
 
