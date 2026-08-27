@@ -21,7 +21,7 @@ from typing import Any
 from flax import nnx
 import jax
 import jax.numpy as jnp
-from jax.experimental import scheduling_groups
+from jax.experimental import xla_metadata
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
@@ -30,8 +30,9 @@ from maxtext.utils import sharding
 
 
 _FSDP_AXIS = "fsdp"
-_FORWARD_PREFETCH_GROUP = "fsdp_forward_prefetch_compute"
-_BACKWARD_PREFETCH_GROUP = "fsdp_backward_prefetch_compute"
+# DeepSeek's explicit batch-split schedule reserves group IDs 40 through 55.
+_FORWARD_PREFETCH_GROUP_ID = 60
+_BACKWARD_PREFETCH_GROUP_ID = 61
 
 
 @dataclass(frozen=True)
@@ -229,10 +230,10 @@ def _forward_layer_pipeline(
   """Runs the forward one-layer-ahead pipeline."""
   first_params = _all_gather_params(_layer_slice(params, 0), mesh, logical_axis_rules)
 
-  @scheduling_groups.scheduling_group(_FORWARD_PREFETCH_GROUP)
   def prefetch_and_compute(current_carry, current_params, current_state, next_sharded_params):
-    next_params = _all_gather_params(next_sharded_params, mesh, logical_axis_rules)
-    next_carry, updated_state = layer_fn(current_carry, (current_params, current_state))
+    with xla_metadata.set_xla_metadata(_scheduling_group_id=_FORWARD_PREFETCH_GROUP_ID):
+      next_params = _all_gather_params(next_sharded_params, mesh, logical_axis_rules)
+      next_carry, updated_state = layer_fn(current_carry, (current_params, current_state))
     return next_carry, next_params, updated_state
 
   def scan_body(pipeline_carry, layer_index):
@@ -282,10 +283,10 @@ def _backward_layer_pipeline(
     input_cotangent, params_cotangent, _ = pullback((carry_cotangent, _layer_slice(state_cotangent, layer_index)))
     return input_cotangent, params_cotangent
 
-  @scheduling_groups.scheduling_group(_BACKWARD_PREFETCH_GROUP)
   def prefetch_and_compute(layer_index, current_params, carry_cotangent, next_sharded_params):
-    next_params = _all_gather_params(next_sharded_params, mesh, logical_axis_rules)
-    carry_cotangent, pending_grad = layer_vjp(layer_index, current_params, carry_cotangent)
+    with xla_metadata.set_xla_metadata(_scheduling_group_id=_BACKWARD_PREFETCH_GROUP_ID):
+      next_params = _all_gather_params(next_sharded_params, mesh, logical_axis_rules)
+      carry_cotangent, pending_grad = layer_vjp(layer_index, current_params, carry_cotangent)
     return carry_cotangent, next_params, pending_grad
 
   last_index = length - 1
