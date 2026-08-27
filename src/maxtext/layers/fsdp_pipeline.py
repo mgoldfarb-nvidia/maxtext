@@ -32,7 +32,6 @@ from maxtext.utils import sharding
 _FSDP_AXIS = "fsdp"
 # DeepSeek's explicit batch-split schedule reserves group IDs 40 through 55.
 _FORWARD_PREFETCH_GROUP_ID = 60
-_BACKWARD_PREFETCH_GROUP_ID = 61
 
 
 @dataclass(frozen=True)
@@ -284,9 +283,8 @@ def _backward_layer_pipeline(
     return input_cotangent, params_cotangent
 
   def prefetch_and_compute(layer_index, current_params, carry_cotangent, next_sharded_params):
-    with xla_metadata.set_xla_metadata(_scheduling_group_id=_BACKWARD_PREFETCH_GROUP_ID):
-      next_params = _all_gather_params(next_sharded_params, mesh, logical_axis_rules)
-      carry_cotangent, pending_grad = layer_vjp(layer_index, current_params, carry_cotangent)
+    next_params = _all_gather_params(next_sharded_params, mesh, logical_axis_rules)
+    carry_cotangent, pending_grad = layer_vjp(layer_index, current_params, carry_cotangent)
     return carry_cotangent, next_params, pending_grad
 
   last_index = length - 1
