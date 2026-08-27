@@ -162,11 +162,17 @@ def _run_layer_pipeline_checks():
 
     lowered_gradient = jax.jit(jax.grad(lambda value: jnp.sum(pipeline(value, sharded_inputs)[0]))).lower(sharded_weights)
     gradient_stablehlo = lowered_gradient.as_text()
+    for group_id in range(160, 164):
+      assert f'_scheduling_group_id = "{group_id}"' in gradient_stablehlo, gradient_stablehlo
     assert "scheduling_group =" not in gradient_stablehlo, gradient_stablehlo
     assert "optimization_barrier" not in gradient_stablehlo, gradient_stablehlo
     gradient_hlo = lowered_gradient.compile().as_text()
     backward_body = [line for line in gradient_hlo.splitlines() if "/transpose(jvp())/while/body/" in line]
-    assert any(" all-gather(" in line for line in backward_body), backward_body
+    for group_id in (161, 162):
+      assert any(
+          " all-gather(" in line and f'_scheduling_group_id="{group_id}"' in line
+          for line in gradient_hlo.splitlines()
+      ), gradient_hlo
     assert any(" reduce-scatter(" in line for line in backward_body), backward_body
     assert all(" all-reduce(" not in line for line in backward_body), backward_body
 

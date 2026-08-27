@@ -30,6 +30,9 @@ from maxtext.utils import sharding
 
 _FSDP_AXIS = "fsdp"
 _FORWARD_PREFETCH_GROUP_BASE = 60
+_BACKWARD_WARMUP_GROUP = 160
+_BACKWARD_LOOP_GROUPS = (161, 162)
+_BACKWARD_DRAIN_GROUP = 163
 
 
 @dataclass(frozen=True)
@@ -333,7 +336,7 @@ def _backward_layer_pipeline(
     mesh: jax.sharding.Mesh,
     logical_axis_rules: Any,
 ) -> tuple[Any, Any]:
-  """Runs the reverse pipeline with on-demand parameter gathers."""
+  """Runs a two-layer reverse pipeline with explicit weight prefetching."""
 
   def layer_vjp(layer_index, current_params, carry_cotangent):
     current_input = _layer_slice(layer_inputs, layer_index)
@@ -346,22 +349,7 @@ def _backward_layer_pipeline(
     input_cotangent, params_cotangent, _ = pullback((carry_cotangent, _layer_slice(state_cotangent, layer_index)))
     return input_cotangent, params_cotangent
 
-  def prefetch_and_compute(layer_index, current_params, carry_cotangent, next_sharded_params):
-    next_params = _all_gather_params(next_sharded_params, mesh, logical_axis_rules)
-    carry_cotangent, pending_grad = layer_vjp(layer_index, current_params, carry_cotangent)
-    return carry_cotangent, next_params, pending_grad
-
-  last_index = length - 1
-  last_params = _all_gather_params(_layer_slice(params, last_index), mesh, logical_axis_rules)
-  carry_cotangent, current_params, pending_grad = prefetch_and_compute(
-      last_index,
-      last_params,
-      output_cotangent,
-      _layer_slice(params, last_index - 1),
-  )
-  all_grad_values = jax.tree.map(jnp.zeros_like, _parameter_values(params))
-
-  def scan_body(pipeline_carry, layer_index):
+  def pipeline_stage(pipeline_carry, layer_index, scheduling_group):
     carry_cotangent, current_params, pending_grad, all_grad_values = pipeline_carry
     reduced_grad = _reduce_scatter_param_values(
         pending_grad,
@@ -369,30 +357,54 @@ def _backward_layer_pipeline(
         mesh,
         logical_axis_rules,
     )
+    with xla_metadata.set_xla_metadata(_scheduling_group_id=scheduling_group):
+      next_params = _all_gather_params(_layer_slice(params, layer_index - 1), mesh, logical_axis_rules)
+      carry_cotangent, next_pending_grad = layer_vjp(layer_index, current_params, carry_cotangent)
     all_grad_values = _insert_layer(all_grad_values, reduced_grad, layer_index + 1)
-    carry_cotangent, next_params, pending_grad = prefetch_and_compute(
-        layer_index,
-        current_params,
-        carry_cotangent,
-        _layer_slice(params, layer_index - 1),
-    )
-    return (carry_cotangent, next_params, pending_grad, all_grad_values), None
+    return carry_cotangent, next_params, next_pending_grad, all_grad_values
 
-  layer_indices = jnp.arange(length - 2, 0, -1, dtype=jnp.int32)
+  last_index = length - 1
+  last_params = _all_gather_params(_layer_slice(params, last_index), mesh, logical_axis_rules)
+  with xla_metadata.set_xla_metadata(_scheduling_group_id=_BACKWARD_WARMUP_GROUP):
+    current_params = _all_gather_params(_layer_slice(params, last_index - 1), mesh, logical_axis_rules)
+    carry_cotangent, pending_grad = layer_vjp(last_index, last_params, output_cotangent)
+  all_grad_values = jax.tree.map(jnp.zeros_like, _parameter_values(params))
+  pipeline_carry = (carry_cotangent, current_params, pending_grad, all_grad_values)
+
+  next_layer_index = length - 2
+  if next_layer_index % 2:
+    pipeline_carry = pipeline_stage(pipeline_carry, next_layer_index, _BACKWARD_LOOP_GROUPS[0])
+    next_layer_index -= 1
+
+  def scan_body(current_pipeline_carry, upper_layer_index):
+    current_pipeline_carry = pipeline_stage(
+        current_pipeline_carry,
+        upper_layer_index,
+        _BACKWARD_LOOP_GROUPS[0],
+    )
+    current_pipeline_carry = pipeline_stage(
+        current_pipeline_carry,
+        upper_layer_index - 1,
+        _BACKWARD_LOOP_GROUPS[1],
+    )
+    return current_pipeline_carry, None
+
+  pair_indices = jnp.arange(next_layer_index, 0, -2, dtype=jnp.int32)
   (carry_cotangent, first_params, pending_grad, all_grad_values), _ = jax.lax.scan(
       scan_body,
-      (carry_cotangent, current_params, pending_grad, all_grad_values),
-      layer_indices,
+      pipeline_carry,
+      pair_indices,
   )
 
-  reduced_grad = _reduce_scatter_param_values(
-      pending_grad,
-      _layer_slice(params, 1),
-      mesh,
-      logical_axis_rules,
-  )
+  with xla_metadata.set_xla_metadata(_scheduling_group_id=_BACKWARD_DRAIN_GROUP):
+    reduced_grad = _reduce_scatter_param_values(
+        pending_grad,
+        _layer_slice(params, 1),
+        mesh,
+        logical_axis_rules,
+    )
+    carry_cotangent, first_grad = layer_vjp(0, first_params, carry_cotangent)
   all_grad_values = _insert_layer(all_grad_values, reduced_grad, 1)
-  carry_cotangent, first_grad = layer_vjp(0, first_params, carry_cotangent)
   reduced_first_grad = _reduce_scatter_param_values(
       first_grad,
       _layer_slice(params, 0),
