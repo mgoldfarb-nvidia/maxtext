@@ -304,10 +304,7 @@ def _forward_layer_pipeline(
   for layer_index in range(length - 1):
     next_sharded_params = _layer_slice(params, layer_index + 1)
     current_state = _layer_slice(state, layer_index)
-    with xla_metadata.set_xla_metadata(
-        _scheduling_group_id=_FORWARD_PREFETCH_GROUP_BASE + layer_index,
-        keep_original_sequence_order_in_group=True,
-    ):
+    with xla_metadata.set_xla_metadata(_scheduling_group_id=_FORWARD_PREFETCH_GROUP_BASE + layer_index):
       next_params = _all_gather_params(next_sharded_params, mesh, logical_axis_rules)
       next_carry, updated_state = layer_fn(current_carry, (current_params, current_state))
     prefix_states.append(updated_state)
