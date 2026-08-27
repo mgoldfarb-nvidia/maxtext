@@ -245,6 +245,13 @@ def _insert_layer(stacked: Any, current: Any, layer_index: Any) -> Any:
   )
 
 
+def _empty_layer_stack(example: Any, length: int) -> Any:
+  return jax.tree.map(
+      lambda value: jnp.zeros((length, *value.shape), dtype=value.dtype),
+      example,
+  )
+
+
 def _forward_layer_pipeline(
     layer_fn: Callable[[Any, tuple[Any, Any]], tuple[Any, Any]],
     initial_carry: Any,
@@ -261,7 +268,7 @@ def _forward_layer_pipeline(
   current_carry = initial_carry
   current_params = first_params
   prefix_states = []
-  prefix_inputs = []
+  layer_inputs = _empty_layer_stack(initial_carry, length)
   for layer_index in range(length - 1):
     next_sharded_params = _layer_slice(params, layer_index + 1)
     current_state = _layer_slice(state, layer_index)
@@ -272,15 +279,16 @@ def _forward_layer_pipeline(
       next_params = _all_gather_params(next_sharded_params, mesh, logical_axis_rules)
       next_carry, updated_state = layer_fn(current_carry, (current_params, current_state))
     prefix_states.append(updated_state)
-    prefix_inputs.append(current_carry)
+    layer_inputs = _insert_layer(layer_inputs, current_carry, layer_index)
     current_carry = next_carry
     current_params = next_params
 
   last_carry, last_state = layer_fn(current_carry, (current_params, _layer_slice(state, length - 1)))
+  layer_inputs = _insert_layer(layer_inputs, current_carry, length - 1)
   return (
       last_carry,
       _stack_last(_stack_sequence(prefix_states), last_state),
-      _stack_last(_stack_sequence(prefix_inputs), current_carry),
+      layer_inputs,
   )
 
 
