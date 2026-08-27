@@ -385,6 +385,9 @@ optimizer_memory_host_offload: false
 parameter_memory_host_offload: false
 # Whether to use jax.lax.scan over layers (stacked/unstacked checkpoint). We recommend setting this to false when using pipeline parallelism, instead scanning the PP iterations. When resuming from a checkpoint, this flag is auto-determined from metadata.
 scan_layers: true
+# Experimental manual one-layer lookahead for FSDP all-gather/reduce-scatter scheduling.
+# Supported only for dense, explicitly sharded, scanned NNX training on GPU.
+fsdp_schedule: 'compiler' # Supported values: compiler, layer_pipeline
 param_scan_axis: 1
 
 # The attention parameter dictates the specific algorithm/methodology used to compute the attention scores

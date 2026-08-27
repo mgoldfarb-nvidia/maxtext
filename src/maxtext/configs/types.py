@@ -110,6 +110,13 @@ class TeCommGemmOverlapPolicy(str, Enum):
   FULL = "full"
 
 
+class FsdpSchedule(str, Enum):
+  """Controls whether FSDP collectives are compiler- or application-scheduled."""
+
+  COMPILER = "compiler"
+  LAYER_PIPELINE = "layer_pipeline"
+
+
 class KvQuantAxis(str, Enum):
   """Axes to quantize over for the Key-Value cache."""
 
@@ -1122,6 +1129,10 @@ class HardwareAndMesh(BaseModel):
           "Whether to use jax.lax.scan over layers (stacked/unstacked checkpoint). "
           "When resuming from a checkpoint, this flag is auto-determined from metadata."
       ),
+  )
+  fsdp_schedule: FsdpSchedule = Field(
+      FsdpSchedule.COMPILER,
+      description="FSDP scheduling strategy. layer_pipeline is an experimental scanned-NNX GPU path.",
   )
   param_scan_axis: int = Field(1, description="Axis to scan over for parameters.")
   context_parallel_load_balance: bool = Field(True, description="Whether to use load balancing for context parallelism.")
@@ -3568,6 +3579,32 @@ class MaxTextConfig(
         self.pipeline_parallel_layers = self.num_decoder_layers
 
     self.using_pipeline_parallelism = self.ici_pipeline_parallelism > 1 or self.dcn_pipeline_parallelism > 1
+    if self.fsdp_schedule == FsdpSchedule.LAYER_PIPELINE:
+      unsupported = []
+      if self.hardware not in ("gpu", "gpu_multiprocess"):
+        unsupported.append("hardware must be gpu or gpu_multiprocess")
+      if self.shard_mode != ShardMode.EXPLICIT:
+        unsupported.append("shard_mode must be explicit")
+      if not self.scan_layers:
+        unsupported.append("scan_layers must be true")
+      if not (self.enable_nnx and self.pure_nnx and self.pure_nnx_decoder):
+        unsupported.append("enable_nnx, pure_nnx, and pure_nnx_decoder must all be true")
+      if self.using_pipeline_parallelism:
+        unsupported.append("pipeline parallelism must be disabled")
+      if self.parameter_memory_host_offload:
+        unsupported.append("parameter_memory_host_offload must be false")
+      if self.quantization:
+        unsupported.append("quantization must be disabled")
+      if self.num_experts > 1:
+        unsupported.append("MoE layers are not supported")
+      if self.use_2d_fsdp_sharding:
+        unsupported.append("use_2d_fsdp_sharding must be false")
+      if self.ici_fsdp_transpose_parallelism != 1 or self.dcn_fsdp_transpose_parallelism != 1:
+        unsupported.append("fsdp_transpose parallelism must be 1")
+      if self.use_batch_split_schedule:
+        unsupported.append("use_batch_split_schedule must be false")
+      if unsupported:
+        raise ValueError("fsdp_schedule='layer_pipeline' requires: " + "; ".join(unsupported))
     if self.using_pipeline_parallelism:
       num_stages = int(self.ici_pipeline_parallelism * self.dcn_pipeline_parallelism)
       if self.num_pipeline_repeats == -1:

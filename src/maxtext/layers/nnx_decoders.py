@@ -37,7 +37,7 @@ from maxtext.common.common_types import (
     ShardMode,
 )
 from maxtext.layers import initializers, linears, mhc, normalizations, quantizations
-from maxtext.layers import nnx_scan, nnx_wrappers
+from maxtext.layers import fsdp_pipeline, nnx_scan, nnx_wrappers
 from maxtext.layers.attentions import Attention
 from maxtext.layers.embeddings import Embed, PositionalEmbedding, attend_on_embedding
 from maxtext.layers.normalizations import RMSNorm
@@ -964,6 +964,10 @@ class NNXDecoder(nnx.Module):
           layers,
           kv_caches_stacked if kv_caches_stacked is not None else None,
       )
+    fsdp_schedule = getattr(self.config, "fsdp_schedule", "compiler")
+    fsdp_schedule = getattr(fsdp_schedule, "value", fsdp_schedule)
+    if fsdp_schedule == "layer_pipeline" and self.model_mode != MODEL_MODE_TRAIN:
+      raise ValueError("fsdp_schedule='layer_pipeline' supports training only.")
     policy = self.get_remat_policy()
     prevent_cse = maxtext_utils.should_prevent_cse_in_remat(self.config)
     graphdef, params, state = nnx.split(layers, nnx.Param, ...)
@@ -984,9 +988,13 @@ class NNXDecoder(nnx.Module):
       return full
 
     dynamic_graph_init = bool(getattr(self, "disable_quant_stats_update", False))
+    if fsdp_schedule == "layer_pipeline" and dynamic_graph_init:
+      raise ValueError("fsdp_schedule='layer_pipeline' does not support dynamic graph updates.")
     updated_graphdef = [graphdef]
 
     use_kv = kv_caches_stacked is not None
+    if fsdp_schedule == "layer_pipeline" and use_kv:
+      raise ValueError("fsdp_schedule='layer_pipeline' does not support external KV caches.")
 
     def layer_fn(carry, scanned_vars):
       # Ensure metadata rank matches the sliced values
@@ -1074,7 +1082,20 @@ class NNXDecoder(nnx.Module):
       params = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(params, length)
       state = maxtext_utils_nnx.nnx_ensure_scan_leading_axis(state, length)
 
-      final_carry, scanned_state = jax.lax.scan(layer_fn_wrapped, x_in, (params, state), unroll=unroll)
+      if fsdp_schedule == "layer_pipeline":
+        if unroll != 1:
+          raise ValueError("fsdp_schedule='layer_pipeline' requires scan unroll=1; use XLA loop unrolling instead.")
+        final_carry, scanned_state = fsdp_pipeline.apply_layer_pipeline(
+            layer_fn_wrapped,
+            x_in,
+            params,
+            state,
+            length=length,
+            mesh=self.mesh,
+            logical_axis_rules=self.config.logical_axis_rules,
+        )
+      else:
+        final_carry, scanned_state = jax.lax.scan(layer_fn_wrapped, x_in, (params, state), unroll=unroll)
       returned_kv_stacked = None
 
       # Move the scan axis to each variable's param_scan_axis and restore its name
