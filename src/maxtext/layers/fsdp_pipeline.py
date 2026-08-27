@@ -33,6 +33,7 @@ _FSDP_AXIS = "fsdp"
 # Alternating IDs keep a prefetched parameter and its next-stage consumer out
 # of the same static group after the two-stage body is rolled into a loop.
 _FORWARD_PREFETCH_GROUP_IDS = (60, 61)
+_FORWARD_TAIL_GROUP_ID = 62
 
 
 @dataclass(frozen=True)
@@ -318,7 +319,7 @@ def _forward_layer_pipeline(
 
   if transition_count % 2:
     (current_carry, last_params), remaining_state, remaining_input = run_stage(
-        _FORWARD_PREFETCH_GROUP_IDS[0],
+        _FORWARD_TAIL_GROUP_ID,
         (current_carry, last_params),
         pair_count * 2,
     )
