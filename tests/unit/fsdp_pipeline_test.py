@@ -147,20 +147,17 @@ def _run_layer_pipeline_checks():
         sharded_weights, sharded_inputs
     )
     stablehlo = lowered_pipeline.as_text()
-    assert '_scheduling_group_id = "60"' in stablehlo, stablehlo
-    assert '_scheduling_group_id = "61"' in stablehlo, stablehlo
-    assert '_scheduling_group_id = "62"' in stablehlo, stablehlo
+    for group_id in range(60, 60 + _NUM_LAYERS - 1):
+      assert f'_scheduling_group_id = "{group_id}"' in stablehlo, stablehlo
     stablehlo_all_gathers = [line for line in stablehlo.splitlines() if '"stablehlo.all_gather"' in line]
-    assert any('_scheduling_group_id = "60"' in line for line in stablehlo_all_gathers), stablehlo_all_gathers
-    assert any('_scheduling_group_id = "61"' in line for line in stablehlo_all_gathers), stablehlo_all_gathers
-    assert any('_scheduling_group_id = "62"' in line for line in stablehlo_all_gathers), stablehlo_all_gathers
+    for group_id in range(60, 60 + _NUM_LAYERS - 1):
+      assert any(f'_scheduling_group_id = "{group_id}"' in line for line in stablehlo_all_gathers), stablehlo_all_gathers
     assert any('_scheduling_group_id = "60"' not in line for line in stablehlo_all_gathers), stablehlo_all_gathers
     assert "scheduling_group =" not in stablehlo, stablehlo
     assert "optimization_barrier" not in stablehlo, stablehlo
     optimized_hlo = lowered_pipeline.compile().as_text()
     all_gathers = [line for line in optimized_hlo.splitlines() if " all-gather(" in line]
-    assert any("/while/body/" in line for line in all_gathers), all_gathers
-    assert any("/while/body/" not in line for line in all_gathers), all_gathers
+    assert all("/while/body/" not in line for line in all_gathers), all_gathers
 
     lowered_gradient = jax.jit(jax.grad(lambda value: jnp.sum(pipeline(value, sharded_inputs)[0]))).lower(sharded_weights)
     gradient_stablehlo = lowered_gradient.as_text()

@@ -30,10 +30,7 @@ from maxtext.utils import sharding
 
 
 _FSDP_AXIS = "fsdp"
-# Alternating IDs keep a prefetched parameter and its next-stage consumer out
-# of the same static group after the two-stage body is rolled into a loop.
-_FORWARD_PREFETCH_GROUP_IDS = (60, 61)
-_FORWARD_TAIL_GROUP_ID = 62
+_FORWARD_PREFETCH_GROUP_BASE = 60
 
 
 @dataclass(frozen=True)
@@ -231,12 +228,8 @@ def _stack_last(prefix: Any, last: Any) -> Any:
   )
 
 
-def _interleave_pairs(first: Any, second: Any) -> Any:
-  def interleave(first_value, second_value):
-    paired = jnp.stack((first_value, second_value), axis=1)
-    return paired.reshape((paired.shape[0] * paired.shape[1], *paired.shape[2:]))
-
-  return jax.tree.map(interleave, first, second)
+def _stack_sequence(values: list[Any]) -> Any:
+  return jax.tree.map(lambda *leaves: jnp.stack(leaves), *values)
 
 
 def _insert_layer(stacked: Any, current: Any, layer_index: Any) -> Any:
@@ -265,69 +258,29 @@ def _forward_layer_pipeline(
   """Runs the forward one-layer-ahead pipeline."""
   first_params = _all_gather_params(_layer_slice(params, 0), mesh, logical_axis_rules)
 
-  def prefetch_and_compute(
-      group_id,
-      current_carry,
-      current_params,
-      current_state,
-      next_sharded_params,
-  ):
-    with xla_metadata.set_xla_metadata(_scheduling_group_id=group_id):
-      next_params = _all_gather_params(next_sharded_params, mesh, logical_axis_rules)
-      next_carry, updated_state = layer_fn(current_carry, (current_params, current_state))
-    return next_carry, next_params, updated_state
-
-  def run_stage(group_id, pipeline_carry, layer_index):
-    current_carry, current_params = pipeline_carry
+  current_carry = initial_carry
+  current_params = first_params
+  prefix_states = []
+  prefix_inputs = []
+  for layer_index in range(length - 1):
     next_sharded_params = _layer_slice(params, layer_index + 1)
     current_state = _layer_slice(state, layer_index)
-    next_carry, next_params, updated_state = prefetch_and_compute(
-        group_id,
-        current_carry,
-        current_params,
-        current_state,
-        next_sharded_params,
-    )
-    return (next_carry, next_params), updated_state, current_carry
+    with xla_metadata.set_xla_metadata(
+        _scheduling_group_id=_FORWARD_PREFETCH_GROUP_BASE + layer_index
+    ):
+      next_params = _all_gather_params(next_sharded_params, mesh, logical_axis_rules)
+      next_carry, updated_state = layer_fn(current_carry, (current_params, current_state))
+    prefix_states.append(updated_state)
+    prefix_inputs.append(current_carry)
+    current_carry = next_carry
+    current_params = next_params
 
-  def scan_body(pipeline_carry, pair_index):
-    first_layer_index = pair_index * 2
-    pipeline_carry, first_state, first_input = run_stage(
-        _FORWARD_PREFETCH_GROUP_IDS[0],
-        pipeline_carry,
-        first_layer_index,
-    )
-    pipeline_carry, second_state, second_input = run_stage(
-        _FORWARD_PREFETCH_GROUP_IDS[1],
-        pipeline_carry,
-        first_layer_index + 1,
-    )
-    return pipeline_carry, ((first_state, second_state), (first_input, second_input))
-
-  transition_count = length - 1
-  pair_count = transition_count // 2
-  pair_indices = jnp.arange(pair_count, dtype=jnp.int32)
-  pipeline_carry, pair_outputs = jax.lax.scan(
-      scan_body,
-      (initial_carry, first_params),
-      pair_indices,
+  last_carry, last_state = layer_fn(current_carry, (current_params, _layer_slice(state, length - 1)))
+  return (
+      last_carry,
+      _stack_last(_stack_sequence(prefix_states), last_state),
+      _stack_last(_stack_sequence(prefix_inputs), current_carry),
   )
-  current_carry, last_params = pipeline_carry
-  (first_state, second_state), (first_inputs, second_inputs) = pair_outputs
-  prefix_state = _interleave_pairs(first_state, second_state)
-  prefix_inputs = _interleave_pairs(first_inputs, second_inputs)
-
-  if transition_count % 2:
-    (current_carry, last_params), remaining_state, remaining_input = run_stage(
-        _FORWARD_TAIL_GROUP_ID,
-        (current_carry, last_params),
-        pair_count * 2,
-    )
-    prefix_state = _stack_last(prefix_state, remaining_state)
-    prefix_inputs = _stack_last(prefix_inputs, remaining_input)
-
-  last_carry, last_state = layer_fn(current_carry, (last_params, _layer_slice(state, length - 1)))
-  return last_carry, _stack_last(prefix_state, last_state), _stack_last(prefix_inputs, current_carry)
 
 
 def _backward_layer_pipeline(
