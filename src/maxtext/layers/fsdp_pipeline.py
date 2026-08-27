@@ -162,7 +162,6 @@ def _all_gather_params(params: Any, mesh: jax.sharding.Mesh, logical_axis_rules:
       plan,
       is_leaf=lambda value: isinstance(value, FsdpGatherLeaf),
   )
-  gathered_values = jax.lax.optimization_barrier(gathered_values)
   return _replace_parameter_values(params, gathered_values)
 
 
@@ -170,7 +169,7 @@ def _reduce_scatter_param_values(grads: Any, params: Any, mesh: jax.sharding.Mes
   """Reshards one layer's gathered parameter gradients."""
   physical_specs = _parameter_specs(params, mesh, logical_axis_rules)
   plan = build_fsdp_gather_plan(physical_specs)
-  grad_values = jax.lax.optimization_barrier(_parameter_values(grads))
+  grad_values = _parameter_values(grads)
 
   def reshard_leaf(value, leaf):
     if leaf.gather_dimension is None:

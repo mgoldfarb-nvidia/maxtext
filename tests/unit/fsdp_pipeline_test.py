@@ -148,6 +148,7 @@ def _run_layer_pipeline_checks():
     )
     stablehlo = lowered_pipeline.as_text()
     assert 'scheduling_group = "fsdp_forward_prefetch_compute"' in stablehlo, stablehlo
+    assert "optimization_barrier" not in stablehlo, stablehlo
     optimized_hlo = lowered_pipeline.compile().as_text()
     all_gathers = [line for line in optimized_hlo.splitlines() if " all-gather(" in line]
     assert any("/while/body/" in line for line in all_gathers), all_gathers
@@ -156,6 +157,7 @@ def _run_layer_pipeline_checks():
     lowered_gradient = jax.jit(jax.grad(lambda value: jnp.sum(pipeline(value, sharded_inputs)[0]))).lower(sharded_weights)
     gradient_stablehlo = lowered_gradient.as_text()
     assert 'scheduling_group = "fsdp_backward_prefetch_compute"' in gradient_stablehlo, gradient_stablehlo
+    assert "optimization_barrier" not in gradient_stablehlo, gradient_stablehlo
     gradient_hlo = lowered_gradient.compile().as_text()
     backward_body = [line for line in gradient_hlo.splitlines() if "/transpose(jvp())/while/body/" in line]
     assert any(" all-gather(" in line for line in backward_body), backward_body
