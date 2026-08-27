@@ -67,9 +67,9 @@ class FsdpPipelineTest(absltest.TestCase):
     plan = fsdp_pipeline.build_fsdp_gather_plan(specs)
 
     self.assertEqual(plan["row"].gather_dimension, 0)
-    self.assertEqual(plan["row"].output_spec, P(None, None))
+    self.assertEqual(plan["row"].output_spec, P(None, None, reduced={"fsdp"}))
     self.assertEqual(plan["combined"].gather_dimension, 1)
-    self.assertEqual(plan["combined"].output_spec, P(None, "tensor"))
+    self.assertEqual(plan["combined"].output_spec, P(None, "tensor", reduced={"fsdp"}))
     self.assertIsNone(plan["replicated"].gather_dimension)
     self.assertEqual(plan["replicated"].output_spec, specs["replicated"])
 
@@ -167,7 +167,8 @@ def _run_layer_pipeline_checks():
     gradient_hlo = lowered_gradient.compile().as_text()
     backward_body = [line for line in gradient_hlo.splitlines() if "/transpose(jvp())/while/body/" in line]
     assert any(" all-gather(" in line for line in backward_body), backward_body
-    assert any(" all-reduce(" in line or " reduce-scatter(" in line for line in backward_body), backward_body
+    assert any(" reduce-scatter(" in line for line in backward_body), backward_body
+    assert all(" all-reduce(" not in line for line in backward_body), backward_body
 
   print("FSDP_PIPELINE_CHECKS_PASSED")
 

@@ -22,7 +22,6 @@ from flax import nnx
 import jax
 import jax.numpy as jnp
 from jax.experimental import xla_metadata
-from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from maxtext.utils import maxtext_utils_nnx
@@ -77,7 +76,7 @@ def _build_gather_leaf(input_spec: P, axis_name: str) -> FsdpGatherLeaf:
   output_spec = P(
       *output_partitions,
       unreduced=input_spec.unreduced,
-      reduced=input_spec.reduced,
+      reduced={*input_spec.reduced, axis_name},
   )
   return FsdpGatherLeaf(input_spec, output_spec, gather_dimension)
 
@@ -158,7 +157,7 @@ def _all_gather_params(params: Any, mesh: jax.sharding.Mesh, logical_axis_rules:
         axis_name=_FSDP_AXIS,
         axis=leaf.gather_dimension,
         tiled=True,
-        to="invarying",
+        to="reduced",
     )
 
   input_specs = jax.tree.map(
@@ -191,22 +190,50 @@ def _all_gather_params(params: Any, mesh: jax.sharding.Mesh, logical_axis_rules:
 
 
 def _reduce_scatter_param_values(grads: Any, params: Any, mesh: jax.sharding.Mesh, logical_axis_rules: Any) -> Any:
-  """Reshards one layer's gathered parameter gradients."""
+  """Reduces and scatters one layer's gathered parameter gradients."""
   physical_specs = _parameter_specs(params, mesh, logical_axis_rules)
   plan = build_fsdp_gather_plan(physical_specs)
-  grad_values = _parameter_values(grads)
 
-  def reshard_leaf(value, leaf):
+  def reduce_leaf(value, leaf):
     if leaf.gather_dimension is None:
       return value
-    return jax.reshard(value, NamedSharding(mesh, leaf.input_spec))
+    return jax.lax.psum_scatter(
+        value,
+        axis_name=_FSDP_AXIS,
+        scatter_dimension=leaf.gather_dimension,
+        tiled=True,
+    )
 
-  return jax.tree.map(
-      reshard_leaf,
-      grad_values,
+  gathered_specs = jax.tree.map(
+      lambda leaf: P(
+          *leaf.output_spec.partitions,
+          unreduced=leaf.output_spec.reduced,
+          reduced=leaf.output_spec.unreduced,
+      ),
       plan,
       is_leaf=lambda value: isinstance(value, FsdpGatherLeaf),
   )
+  sharded_specs = jax.tree.map(
+      lambda leaf: leaf.input_spec,
+      plan,
+      is_leaf=lambda value: isinstance(value, FsdpGatherLeaf),
+  )
+
+  def reduce_values(values):
+    return jax.tree.map(
+        reduce_leaf,
+        values,
+        plan,
+        is_leaf=lambda value: isinstance(value, FsdpGatherLeaf),
+    )
+
+  return jax.shard_map(
+      reduce_values,
+      mesh=mesh,
+      in_specs=(gathered_specs,),
+      out_specs=sharded_specs,
+      check_vma=True,
+  )(_parameter_values(grads))
 
 
 def _layer_slice(stacked: Any, layer_index: Any) -> Any:
