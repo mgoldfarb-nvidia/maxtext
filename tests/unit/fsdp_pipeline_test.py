@@ -149,6 +149,7 @@ def _run_layer_pipeline_checks():
     stablehlo = lowered_pipeline.as_text()
     for group_id in range(60, 60 + _NUM_LAYERS - 1):
       assert f'_scheduling_group_id = "{group_id}"' in stablehlo, stablehlo
+    assert 'keep_original_sequence_order_in_group = "true"' in stablehlo, stablehlo
     stablehlo_all_gathers = [line for line in stablehlo.splitlines() if '"stablehlo.all_gather"' in line]
     for group_id in range(60, 60 + _NUM_LAYERS - 1):
       assert any(f'_scheduling_group_id = "{group_id}"' in line for line in stablehlo_all_gathers), stablehlo_all_gathers
