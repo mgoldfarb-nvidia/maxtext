@@ -246,8 +246,13 @@ def _insert_layer(stacked: Any, current: Any, layer_index: Any) -> Any:
 
 
 def _empty_layer_stack(example: Any, length: int) -> Any:
+  def empty_leaf(value):
+    spec = value.sharding.spec
+    stack_spec = P(None, *spec, unreduced=spec.unreduced, reduced=spec.reduced)
+    return jnp.zeros((length, *value.shape), dtype=value.dtype, out_sharding=stack_spec)
+
   return jax.tree.map(
-      lambda value: jnp.zeros((length, *value.shape), dtype=value.dtype),
+      empty_leaf,
       example,
   )
 
