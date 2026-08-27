@@ -151,17 +151,43 @@ def _all_gather_params(params: Any, mesh: jax.sharding.Mesh, logical_axis_rules:
   if not any(leaf.gather_dimension is not None for leaf in plan_leaves):
     raise ValueError("fsdp_schedule='layer_pipeline' found no parameters sharded over the 'fsdp' mesh axis.")
 
-  def reshard_leaf(value, leaf):
+  def gather_leaf(value, leaf):
     if leaf.gather_dimension is None:
       return value
-    return jax.reshard(value, NamedSharding(mesh, leaf.output_spec))
+    return jax.lax.all_gather(
+        value,
+        axis_name=_FSDP_AXIS,
+        axis=leaf.gather_dimension,
+        tiled=True,
+        to="invarying",
+    )
 
-  gathered_values = jax.tree.map(
-      reshard_leaf,
-      _parameter_values(params),
+  input_specs = jax.tree.map(
+      lambda leaf: leaf.input_spec,
       plan,
       is_leaf=lambda value: isinstance(value, FsdpGatherLeaf),
   )
+  output_specs = jax.tree.map(
+      lambda leaf: leaf.output_spec,
+      plan,
+      is_leaf=lambda value: isinstance(value, FsdpGatherLeaf),
+  )
+
+  def gather_values(values):
+    return jax.tree.map(
+        gather_leaf,
+        values,
+        plan,
+        is_leaf=lambda value: isinstance(value, FsdpGatherLeaf),
+    )
+
+  gathered_values = jax.shard_map(
+      gather_values,
+      mesh=mesh,
+      in_specs=(input_specs,),
+      out_specs=output_specs,
+      check_vma=True,
+  )(_parameter_values(params))
   return _replace_parameter_values(params, gathered_values)
 
 
@@ -351,9 +377,9 @@ def apply_layer_pipeline(
 ) -> tuple[Any, Any]:
   """Runs a scanned layer stack with one-layer-ahead FSDP weight prefetching.
 
-  The reshard is outside ``layer_fn`` so a checkpointed layer computation does
-  not rematerialize communication. SPMD lowers the explicit sharded-to-replicated
-  boundary to an all-gather and its transpose to the corresponding reduction.
+  The collective is outside ``layer_fn`` so a checkpointed layer computation
+  does not rematerialize communication. The custom backward pass explicitly
+  gathers weights and reduces their gradients.
   """
   if length < 2:
     raise ValueError("fsdp_schedule='layer_pipeline' requires at least two scanned layers.")

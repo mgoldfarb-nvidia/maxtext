@@ -148,6 +148,9 @@ def _run_layer_pipeline_checks():
     )
     stablehlo = lowered_pipeline.as_text()
     assert '_scheduling_group_id = "60"' in stablehlo, stablehlo
+    stablehlo_all_gathers = [line for line in stablehlo.splitlines() if '"stablehlo.all_gather"' in line]
+    assert any('_scheduling_group_id = "60"' in line for line in stablehlo_all_gathers), stablehlo_all_gathers
+    assert any('_scheduling_group_id = "60"' not in line for line in stablehlo_all_gathers), stablehlo_all_gathers
     assert "scheduling_group =" not in stablehlo, stablehlo
     assert "optimization_barrier" not in stablehlo, stablehlo
     optimized_hlo = lowered_pipeline.compile().as_text()
