@@ -32,7 +32,6 @@ _FSDP_AXIS = "fsdp"
 _FORWARD_PREFETCH_GROUP_BASE = 60
 _BACKWARD_WARMUP_GROUP = 160
 _BACKWARD_LOOP_GROUPS = (161, 162)
-_BACKWARD_DRAIN_GROUP = 163
 
 
 @dataclass(frozen=True)
@@ -359,7 +358,7 @@ def _backward_layer_pipeline(
     )
     with xla_metadata.set_xla_metadata(_scheduling_group_id=scheduling_group):
       next_params = _all_gather_params(_layer_slice(params, layer_index - 1), mesh, logical_axis_rules)
-      carry_cotangent, next_pending_grad = layer_vjp(layer_index, current_params, carry_cotangent)
+    carry_cotangent, next_pending_grad = layer_vjp(layer_index, current_params, carry_cotangent)
     all_grad_values = _insert_layer(all_grad_values, reduced_grad, layer_index + 1)
     return carry_cotangent, next_params, next_pending_grad, all_grad_values
 
@@ -367,7 +366,7 @@ def _backward_layer_pipeline(
   last_params = _all_gather_params(_layer_slice(params, last_index), mesh, logical_axis_rules)
   with xla_metadata.set_xla_metadata(_scheduling_group_id=_BACKWARD_WARMUP_GROUP):
     current_params = _all_gather_params(_layer_slice(params, last_index - 1), mesh, logical_axis_rules)
-    carry_cotangent, pending_grad = layer_vjp(last_index, last_params, output_cotangent)
+  carry_cotangent, pending_grad = layer_vjp(last_index, last_params, output_cotangent)
   all_grad_values = jax.tree.map(jnp.zeros_like, _parameter_values(params))
   pipeline_carry = (carry_cotangent, current_params, pending_grad, all_grad_values)
 
@@ -396,14 +395,13 @@ def _backward_layer_pipeline(
       pair_indices,
   )
 
-  with xla_metadata.set_xla_metadata(_scheduling_group_id=_BACKWARD_DRAIN_GROUP):
-    reduced_grad = _reduce_scatter_param_values(
-        pending_grad,
-        _layer_slice(params, 1),
-        mesh,
-        logical_axis_rules,
-    )
-    carry_cotangent, first_grad = layer_vjp(0, first_params, carry_cotangent)
+  reduced_grad = _reduce_scatter_param_values(
+      pending_grad,
+      _layer_slice(params, 1),
+      mesh,
+      logical_axis_rules,
+  )
+  carry_cotangent, first_grad = layer_vjp(0, first_params, carry_cotangent)
   all_grad_values = _insert_layer(all_grad_values, reduced_grad, 1)
   reduced_first_grad = _reduce_scatter_param_values(
       first_grad,

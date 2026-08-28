@@ -162,8 +162,15 @@ def _run_layer_pipeline_checks():
 
     lowered_gradient = jax.jit(jax.grad(lambda value: jnp.sum(pipeline(value, sharded_inputs)[0]))).lower(sharded_weights)
     gradient_stablehlo = lowered_gradient.as_text()
-    for group_id in range(160, 164):
+    for group_id in range(160, 163):
       assert f'_scheduling_group_id = "{group_id}"' in gradient_stablehlo, gradient_stablehlo
+    backward_group_attributes = tuple(f'_scheduling_group_id = "{group_id}"' for group_id in range(160, 163))
+    backward_grouped_dot_generals = [
+        line
+        for line in gradient_stablehlo.splitlines()
+        if "stablehlo.dot_general" in line and any(attribute in line for attribute in backward_group_attributes)
+    ]
+    assert not backward_grouped_dot_generals, backward_grouped_dot_generals
     assert "scheduling_group =" not in gradient_stablehlo, gradient_stablehlo
     assert "optimization_barrier" not in gradient_stablehlo, gradient_stablehlo
     gradient_hlo = lowered_gradient.compile().as_text()
